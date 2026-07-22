@@ -355,11 +355,28 @@ pub struct Genome {
     pub vinf_dep: [f64; 3],
     /// Low-thrust throttle per segment (velocity frame), empty = ballistic.
     pub thrust: Vec<[f64; 3]>,
+    /// Per-leg deep-space maneuver, one entry per leg: `[frac, dvx, dvy, dvz]`.
+    /// `frac` is where along the leg the burn happens (fraction of the leg's
+    /// TOF); the vector is a km/s kick applied to the leg's *departure*
+    /// velocity, after which a second Lambert arc closes onto the arrival
+    /// node and the mismatch it needs is charged as the real DSM Δv. This is
+    /// the standard MGA-1DSM parameterization, and it degenerates *exactly*
+    /// to the ballistic leg at `dv = 0` — so enabling DSMs can never make a
+    /// tour worse, only open extra freedom (the VEEGA/EGA-enabling one).
+    /// Empty = ballistic tour.
+    pub dsm: Vec<[f64; 4]>,
 }
 
 impl Genome {
     pub fn total_tof_days(&self) -> f64 {
         self.legs.iter().sum()
+    }
+
+    /// The DSM parameters for leg `i`, or `None` if this leg flies ballistic.
+    fn leg_dsm(&self, i: usize) -> Option<&[f64; 4]> {
+        self.dsm
+            .get(i)
+            .filter(|d| d[1] != 0.0 || d[2] != 0.0 || d[3] != 0.0)
     }
 }
 
@@ -601,6 +618,127 @@ pub fn lambert_rev(
     Some((v1, v2))
 }
 
+/// Hard cap on the revolution sweep in [`lambert_best`]. The geometric bound
+/// `floor(tof / T_min)` is the physically correct limit, but for a very long
+/// TOF against a very small transfer ellipse it can run to hundreds — far past
+/// anything a mission would fly, and each extra `m` costs two bisections.
+const MAX_LAMBERT_REVS: u32 = 20;
+
+/// Largest revolution count that can possibly solve this geometry in `tof_s`.
+///
+/// The m-rev branch only exists once the TOF exceeds the m-rev minimum, which
+/// is itself strictly greater than `m` periods of the minimum-energy transfer
+/// ellipse (`a_min = s/2`, `s` the triangle semiperimeter). So
+/// `floor(tof / T_min)` is a tight, cheap upper bound — no magic constant.
+fn max_revs(r1: [f64; 3], r2: [f64; 3], tof_s: f64, mu: f64) -> u32 {
+    let n = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let (r1n, r2n) = (n(r1), n(r2));
+    let c = n([r2[0] - r1[0], r2[1] - r1[1], r2[2] - r1[2]]);
+    let a_min = 0.25 * (r1n + r2n + c); // = s/2
+    if !(a_min > 0.0) || mu <= 0.0 || !tof_s.is_finite() {
+        return 0;
+    }
+    let t_min = 2.0 * std::f64::consts::PI * (a_min * a_min * a_min / mu).sqrt();
+    if !(t_min > 0.0) {
+        return 0;
+    }
+    ((tof_s / t_min).floor().max(0.0) as u32).min(MAX_LAMBERT_REVS)
+}
+
+/// Best Lambert conic for a leg: sweep every feasible revolution count and
+/// both multi-rev branches, and keep whichever arc leaves the start node with
+/// the velocity closest to `vref` (the departure body's own velocity — i.e.
+/// the cheapest v∞).
+///
+/// This is the single entry point for leg solving; the revolution ceiling
+/// comes from the geometry (see [`max_revs`]), never a hardcoded TOF.
+/// Deterministic: fixed sweep order, ties broken by first-seen.
+pub fn lambert_best(
+    r1: [f64; 3],
+    r2: [f64; 3],
+    tof_s: f64,
+    mu: f64,
+    vref: [f64; 3],
+) -> Option<([f64; 3], [f64; 3])> {
+    let cost = |o: &([f64; 3], [f64; 3])| {
+        let d = [o.0[0] - vref[0], o.0[1] - vref[1], o.0[2] - vref[2]];
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+    };
+    let mut best: Option<([f64; 3], [f64; 3])> = None;
+    let mut consider = |o: Option<([f64; 3], [f64; 3])>| {
+        if let Some(v) = o {
+            if !v.0.iter().chain(v.1.iter()).all(|c| c.is_finite()) {
+                return;
+            }
+            if best.as_ref().is_none_or(|b| cost(&v) < cost(b)) {
+                best = Some(v);
+            }
+        }
+    };
+    consider(lambert_rev(r1, r2, tof_s, mu, 0, false));
+    for m in 1..=max_revs(r1, r2, tof_s, mu) {
+        consider(lambert_rev(r1, r2, tof_s, mu, m, false));
+        consider(lambert_rev(r1, r2, tof_s, mu, m, true));
+    }
+    best
+}
+
+/// Where along a leg a DSM may sit. Burning in the first/last few percent of
+/// a leg is indistinguishable from retargeting the node itself and makes the
+/// second Lambert arc numerically degenerate.
+const DSM_FRAC_RANGE: (f64, f64) = (0.05, 0.95);
+
+/// One solved tour leg, ballistic or with a deep-space maneuver.
+#[derive(Clone)]
+struct LegArc {
+    /// Heliocentric velocity leaving the start node.
+    v_start: [f64; 3],
+    /// Heliocentric velocity arriving at the end node.
+    v_end: [f64; 3],
+    /// Δv the mid-leg maneuver actually costs, km/s (0 when ballistic).
+    dsm_dv: f64,
+    /// `(seconds after the start node, position, velocity *after* the burn)`.
+    dsm: Option<(f64, [f64; 3], [f64; 3])>,
+}
+
+/// Solve one leg from `r1` to `r2` in `tof_s`.
+///
+/// Ballistic (`dsm = None`): a single [`lambert_best`] arc. With a DSM: kick
+/// the departure velocity by the genome's vector, coast that conic to the
+/// maneuver point, then solve a second Lambert arc onto the arrival node —
+/// the velocity discontinuity there is the DSM Δv the score pays for.
+fn solve_leg(
+    r1: [f64; 3],
+    r2: [f64; 3],
+    tof_s: f64,
+    mu: f64,
+    vref: [f64; 3],
+    dsm: Option<&[f64; 4]>,
+) -> Option<LegArc> {
+    let (v1, v2) = lambert_best(r1, r2, tof_s, mu, vref)?;
+    let Some(d) = dsm else {
+        return Some(LegArc { v_start: v1, v_end: v2, dsm_dv: 0.0, dsm: None });
+    };
+    let frac = d[0].clamp(DSM_FRAC_RANGE.0, DSM_FRAC_RANGE.1);
+    let t1 = frac * tof_s;
+    let v_start = [v1[0] + d[1], v1[1] + d[2], v1[2] + d[3]];
+    let (rm, vm) = kepler_universal(r1, v_start, t1, mu);
+    if !rm.iter().chain(vm.iter()).all(|c| c.is_finite()) {
+        return None;
+    }
+    // vref = vm: of the arcs that close onto the arrival node, prefer the one
+    // needing the smallest burn.
+    let (vm_req, v_end) = lambert_best(rm, r2, tof_s - t1, mu, vm)?;
+    let dv = [vm_req[0] - vm[0], vm_req[1] - vm[1], vm_req[2] - vm[2]];
+    let dsm_dv = (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt();
+    Some(LegArc {
+        v_start,
+        v_end,
+        dsm_dv,
+        dsm: Some((t1, rm, vm_req)),
+    })
+}
+
 /// One gravity assist in a tour solution.
 #[derive(Clone, Copy)]
 pub struct Flyby {
@@ -628,6 +766,8 @@ pub struct Solution {
     pub thrust_dv_kms: f64,
     /// Total powered-flyby Δv across the tour, km/s (0 for direct).
     pub assist_dv_kms: f64,
+    /// Total deep-space-maneuver Δv across the tour, km/s (0 for direct).
+    pub dsm_dv_kms: f64,
     pub flybys: Vec<Flyby>,
     pub miss_km: f64,
     pub depart: Epoch,
@@ -796,6 +936,7 @@ fn evaluate_lowthrust(
         arrival_dv_kms: arrival_dv,
         thrust_dv_kms: thrust_dv,
         assist_dv_kms: 0.0,
+        dsm_dv_kms: 0.0,
         flybys: Vec::new(),
         miss_km,
         depart,
@@ -808,8 +949,10 @@ fn evaluate_lowthrust(
 /// flybys checked against the physical bending limit
 /// δ_max = 2·asin(μ/(μ + r_p·v∞²)) at minimum safe periapsis, with powered-
 /// flyby Δv charged for the |v∞| mismatch and any turn deficit. This is the
-/// standard first-order tour-scouting formulation (STOUR/GALLOP class);
-/// PN-dynamics refinement of a chosen tour is future work.
+/// standard first-order tour-scouting formulation (STOUR/GALLOP class), now
+/// with an optional deep-space maneuver per leg (MGA-1DSM); [`refine_tour`]
+/// re-flies a chosen tour under the full n-body dynamics.
+///
 /// Node epochs and body states for a tour genome.
 fn tour_nodes(
     eph: &Ephemeris,
@@ -850,6 +993,7 @@ fn evaluate_tour(
         arrival_dv_kms: 0.0,
         thrust_dv_kms: 0.0,
         assist_dv_kms: 0.0,
+        dsm_dv_kms: 0.0,
         flybys: Vec::new(),
         miss_km: f64::INFINITY,
         depart,
@@ -857,38 +1001,31 @@ fn evaluate_tour(
         traj: Vec::new(),
     };
 
-    // Solve each leg. Long legs also try one-rev solutions and keep whichever
-    // conic needs the least velocity at the leg's start node (deterministic).
-    let mut legs_v: Vec<([f64; 3], [f64; 3])> = Vec::with_capacity(g.legs.len());
+    // Solve each leg over every feasible revolution count and branch, with the
+    // genome's deep-space maneuver if it carries one.
+    let mut arcs: Vec<LegArc> = Vec::with_capacity(g.legs.len());
     for (i, tof) in g.legs.iter().enumerate() {
-        let (r1, r2) = (states[i].pos_km, states[i + 1].pos_km);
-        let tof_s = tof * DAY_S;
-        let mut options: Vec<([f64; 3], [f64; 3])> = Vec::new();
-        options.extend(lambert_rev(r1, r2, tof_s, mu, 0, false));
-        if *tof > 550.0 {
-            options.extend(lambert_rev(r1, r2, tof_s, mu, 1, false));
-            options.extend(lambert_rev(r1, r2, tof_s, mu, 1, true));
-        }
-        let vref = states[i].vel_km_s;
-        let best = options.into_iter().min_by(|a, b| {
-            let cost = |o: &([f64; 3], [f64; 3])| {
-                let d = [o.0[0] - vref[0], o.0[1] - vref[1], o.0[2] - vref[2]];
-                d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
-            };
-            cost(a).total_cmp(&cost(b))
-        });
-        match best {
-            Some(v) => legs_v.push(v),
+        let arc = solve_leg(
+            states[i].pos_km,
+            states[i + 1].pos_km,
+            tof * DAY_S,
+            mu,
+            states[i].vel_km_s,
+            g.leg_dsm(i),
+        );
+        match arc {
+            Some(a) => arcs.push(a),
             None => return bad(100.0 * (i + 1) as f64),
         }
     }
+    let dsm_dv: f64 = arcs.iter().map(|a| a.dsm_dv).sum();
 
     let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 
-    let vinf_dep = norm(sub(legs_v[0].0, states[0].vel_km_s));
+    let vinf_dep = norm(sub(arcs[0].v_start, states[0].vel_km_s));
     let vinf_arr = norm(sub(
-        legs_v.last().unwrap().1,
+        arcs.last().unwrap().v_end,
         states.last().unwrap().vel_km_s,
     ));
 
@@ -897,8 +1034,8 @@ fn evaluate_tour(
     let mut assist_dv = 0.0;
     for k in 1..seq.len() - 1 {
         let body = seq[k];
-        let vin = sub(legs_v[k - 1].1, states[k].vel_km_s);
-        let vout = sub(legs_v[k].0, states[k].vel_km_s);
+        let vin = sub(arcs[k - 1].v_end, states[k].vel_km_s);
+        let vout = sub(arcs[k].v_start, states[k].vel_km_s);
         let (nin, nout) = (norm(vin), norm(vout));
         if nin < 1e-3 || nout < 1e-3 {
             return bad(50.0);
@@ -937,27 +1074,40 @@ fn evaluate_tour(
 
     let total_tof = g.total_tof_days();
     let arrival_dv = arrival_dv_kms(cfg.target, vinf_arr, cfg.mission);
-    let score = cfg.objective.score(vinf_dep, arrival_dv, total_tof) + assist_dv;
+    // DSM Δv is real propellant, charged exactly like powered-flyby Δv.
+    let score = cfg.objective.score(vinf_dep, arrival_dv, total_tof) + assist_dv + dsm_dv;
 
-    // Sample each Lambert conic for rendering.
+    // Sample each conic for rendering — two sub-arcs when the leg has a DSM.
     let per_leg = (n_samples / g.legs.len().max(1)).max(8);
     let mut traj = Vec::with_capacity(per_leg * g.legs.len() + 1);
     for (i, tof) in g.legs.iter().enumerate() {
-        let (r0, v0) = (states[i].pos_km, legs_v[i].0);
-        for j in 0..per_leg {
-            let dt = tof * DAY_S * j as f64 / per_leg as f64;
-            let (r, v) = kepler_universal(r0, v0, dt, mu);
-            traj.push((
-                epochs[i] + Duration::from_seconds(dt),
-                ScState { pos: r, vel: v },
-            ));
+        let tof_s = tof * DAY_S;
+        // (start position, start velocity, elapsed offset, duration) per sub-arc.
+        let subs: Vec<([f64; 3], [f64; 3], f64, f64)> = match arcs[i].dsm {
+            Some((t1, rm, vm_req)) => vec![
+                (states[i].pos_km, arcs[i].v_start, 0.0, t1),
+                (rm, vm_req, t1, tof_s - t1),
+            ],
+            None => vec![(states[i].pos_km, arcs[i].v_start, 0.0, tof_s)],
+        };
+        for (r0, v0, t0, span) in subs {
+            // Samples proportional to the sub-arc's share of the leg.
+            let n = ((per_leg as f64 * span / tof_s).round() as usize).max(4);
+            for j in 0..n {
+                let dt = span * j as f64 / n as f64;
+                let (r, v) = kepler_universal(r0, v0, dt, mu);
+                traj.push((
+                    epochs[i] + Duration::from_seconds(t0 + dt),
+                    ScState { pos: r, vel: v },
+                ));
+            }
         }
     }
     traj.push((
         *epochs.last().unwrap(),
         ScState {
             pos: states.last().unwrap().pos_km,
-            vel: legs_v.last().unwrap().1,
+            vel: arcs.last().unwrap().v_end,
         },
     ));
 
@@ -969,6 +1119,7 @@ fn evaluate_tour(
         arrival_dv_kms: arrival_dv,
         thrust_dv_kms: 0.0,
         assist_dv_kms: assist_dv,
+        dsm_dv_kms: dsm_dv,
         flybys,
         miss_km: 0.0,
         depart,
@@ -1061,6 +1212,7 @@ fn evaluate_direct(
         arrival_dv_kms: arrival_dv,
         thrust_dv_kms: 0.0,
         assist_dv_kms: 0.0,
+        dsm_dv_kms: 0.0,
         flybys: Vec::new(),
         miss_km,
         depart,
@@ -1090,6 +1242,12 @@ fn genome_key(g: &Genome) -> u64 {
     for seg in &g.thrust {
         for c in seg {
             mix((c * 20.0) as i64);
+        }
+    }
+    for node in &g.dsm {
+        mix((node[0] * 50.0) as i64); // 2% buckets on the burn's position
+        for c in &node[1..] {
+            mix((c * 100.0) as i64); // 10 m/s buckets, same as v∞
         }
     }
     h
@@ -1174,25 +1332,20 @@ impl Search {
         let earth = self.fast_eph.state(BodyId::Earth, depart);
         let tgt = self.fast_eph.state(self.cfg.target, arrive);
         let mu = BodyId::Sun.gm();
-        let mut options: Vec<[f64; 3]> = Vec::new();
-        let mut push = |o: Option<([f64; 3], [f64; 3])>| {
-            if let Some((v1, _)) = o {
-                options.push([
-                    v1[0] - earth.vel_km_s[0],
-                    v1[1] - earth.vel_km_s[1],
-                    v1[2] - earth.vel_km_s[2],
-                ]);
-            }
-        };
-        push(lambert_rev(earth.pos_km, tgt.pos_km, tof_days * DAY_S, mu, 0, false));
-        if tof_days > 550.0 {
-            push(lambert_rev(earth.pos_km, tgt.pos_km, tof_days * DAY_S, mu, 1, false));
-            push(lambert_rev(earth.pos_km, tgt.pos_km, tof_days * DAY_S, mu, 1, true));
-        }
-        options.into_iter().min_by(|a, b| {
-            let n = |v: &[f64; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-            n(a).total_cmp(&n(b))
-        })
+        // Closest-to-Earth's-velocity arc = smallest v∞, over every feasible
+        // revolution count and branch.
+        let (v1, _) = lambert_best(
+            earth.pos_km,
+            tgt.pos_km,
+            tof_days * DAY_S,
+            mu,
+            earth.vel_km_s,
+        )?;
+        Some([
+            v1[0] - earth.vel_km_s[0],
+            v1[1] - earth.vel_km_s[1],
+            v1[2] - earth.vel_km_s[2],
+        ])
     }
 
     fn random_genome(&mut self) -> Genome {
@@ -1289,11 +1442,21 @@ impl Search {
         } else {
             Vec::new()
         };
+        // Tours get a DSM node per leg, seeded *inert* (zero Δv, mid-leg):
+        // an inert node is bit-for-bit the ballistic leg, so seeding them can
+        // only ever open search freedom, never cost score. Mutation is what
+        // switches one on.
+        let dsm = if self.cfg.route.is_empty() {
+            Vec::new()
+        } else {
+            vec![[0.5, 0.0, 0.0, 0.0]; legs.len()]
+        };
         Genome {
             depart_days,
             legs,
             vinf_dep,
             thrust,
+            dsm,
         }
     }
 
@@ -1351,11 +1514,28 @@ impl Search {
                     }
                 }
                 2 | 3 => {
-                    // Tours: fine-nudge one leg — flyby feasibility is very
-                    // sensitive to timing, so small edits matter.
-                    let i = self.rng.below(g.legs.len());
-                    let (lo, hi) = self.leg_bounds[i];
-                    g.legs[i] = (g.legs[i] + self.rng.sym() * 4.0).clamp(lo, hi);
+                    if !g.dsm.is_empty() && self.rng.below(2) == 0 {
+                        // Tours: edit one leg's deep-space maneuver. Small
+                        // kicks — a DSM is a course shaping burn, and the
+                        // score charges every m/s of it, so the search has to
+                        // discover that a burn pays for itself.
+                        let i = self.rng.below(g.dsm.len());
+                        if self.rng.below(4) == 0 {
+                            // Slide the burn along the leg.
+                            g.dsm[i][0] = (g.dsm[i][0] + self.rng.sym() * 0.15)
+                                .clamp(DSM_FRAC_RANGE.0, DSM_FRAC_RANGE.1);
+                        } else {
+                            let c = 1 + self.rng.below(3);
+                            g.dsm[i][c] = (g.dsm[i][c] + self.rng.sym() * 0.15)
+                                .clamp(-2.0, 2.0);
+                        }
+                    } else {
+                        // Fine-nudge one leg — flyby feasibility is very
+                        // sensitive to timing, so small edits matter.
+                        let i = self.rng.below(g.legs.len());
+                        let (lo, hi) = self.leg_bounds[i];
+                        g.legs[i] = (g.legs[i] + self.rng.sym() * 4.0).clamp(lo, hi);
+                    }
                 }
                 _ => {
                     if tour {
@@ -1437,6 +1617,7 @@ pub fn differential_correct(
             legs: vec![tof.to_seconds() / DAY_S],
             vinf_dep: vinf,
             thrust: Vec::new(),
+            dsm: Vec::new(),
         };
         let cfg = SolverConfig {
             route: Vec::new(),
@@ -1499,6 +1680,112 @@ pub fn differential_correct(
     (vinf, norm(f))
 }
 
+/// Damped Newton on a 3-vector residual with a finite-difference Jacobian.
+/// Shared by every shooting stage; returns the corrected vector and the final
+/// residual norm. Deterministic: fixed iteration count and step order.
+fn newton_shoot(
+    shoot: &dyn Fn([f64; 3]) -> [f64; 3],
+    v0: [f64; 3],
+    iters: usize,
+    tol_km: f64,
+) -> ([f64; 3], f64) {
+    let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let mut v = v0;
+    let mut f = shoot(v);
+    for _ in 0..iters {
+        if norm(f) < tol_km {
+            break;
+        }
+        const H: f64 = 1e-4;
+        let mut jac = [[0.0f64; 3]; 3];
+        for c in 0..3 {
+            let mut vp = v;
+            vp[c] += H;
+            let fp = shoot(vp);
+            for r in 0..3 {
+                jac[r][c] = (fp[r] - f[r]) / H;
+            }
+        }
+        let det = jac[0][0] * (jac[1][1] * jac[2][2] - jac[1][2] * jac[2][1])
+            - jac[0][1] * (jac[1][0] * jac[2][2] - jac[1][2] * jac[2][0])
+            + jac[0][2] * (jac[1][0] * jac[2][1] - jac[1][1] * jac[2][0]);
+        if det.abs() < 1e-12 {
+            break;
+        }
+        let rhs = [-f[0], -f[1], -f[2]];
+        let solve_col = |col: usize| {
+            let mut m = jac;
+            for r in 0..3 {
+                m[r][col] = rhs[r];
+            }
+            (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+                / det
+        };
+        let dv = [solve_col(0), solve_col(1), solve_col(2)];
+        // Damp absurd steps (near-singular geometry).
+        let dvn = norm(dv);
+        let scale = if dvn > 1.0 { 1.0 / dvn } else { 1.0 };
+        for c in 0..3 {
+            v[c] += dv[c] * scale;
+        }
+        f = shoot(v);
+    }
+    (v, norm(f))
+}
+
+/// Coordinate descent on the patch *schedule*: nudge the departure epoch and
+/// each leg's flight time, keeping any move that improves the patched-conic
+/// score. Flyby feasibility is far more sensitive to when you arrive than to
+/// how you fly there, so letting the corrector move patch epochs — rather than
+/// freezing them at whatever the beam happened to sample — is what makes a
+/// scouted tour close up under real dynamics.
+///
+/// Runs on the cheap conic model (a full n-body schedule optimization would
+/// cost thousands of propagations); the n-body shooting then flies the
+/// improved schedule. Deterministic: fixed step ladder, fixed probe order.
+pub fn optimize_patch_epochs(
+    eph: &Ephemeris,
+    cfg: &SolverConfig,
+    epoch0: Epoch,
+    g: &Genome,
+) -> Genome {
+    let bounds = cfg.leg_bounds();
+    let score = |c: &Genome| evaluate_tour(eph, cfg, epoch0, c, 2).score;
+    let mut best = g.clone();
+    let mut best_score = score(&best);
+    // Days: coarse enough to hop a bad flyby geometry, refined to sub-hour.
+    let mut step = 8.0;
+    for _ in 0..9 {
+        let mut improved = true;
+        while improved {
+            improved = false;
+            // Probe index 0 = departure epoch, 1..=n = each leg's TOF.
+            for k in 0..=best.legs.len() {
+                for sign in [1.0f64, -1.0] {
+                    let mut trial = best.clone();
+                    if k == 0 {
+                        trial.depart_days =
+                            (trial.depart_days + sign * step).clamp(0.0, cfg.window_days);
+                    } else {
+                        let (lo, hi) = bounds[k - 1];
+                        trial.legs[k - 1] = (trial.legs[k - 1] + sign * step).clamp(lo, hi);
+                    }
+                    let s = score(&trial);
+                    if s < best_score {
+                        best_score = s;
+                        best = trial;
+                        improved = true;
+                    }
+                }
+            }
+        }
+        step *= 0.5;
+    }
+    best
+}
+
 /// A tour refined to mission grade: every leg is a continuous full-fidelity
 /// n-body trajectory hitting its patch body at the patch epoch.
 #[derive(Clone)]
@@ -1510,16 +1797,29 @@ pub struct RefinedTour {
     pub vinf_dep_kms: f64,
     pub vinf_arr_kms: f64,
     pub assist_dv_kms: f64,
+    /// Total deep-space-maneuver Δv actually flown, km/s.
+    pub dsm_dv_kms: f64,
     /// Largest per-leg targeting residual after correction, km.
     pub worst_miss_km: f64,
+    /// The genome as refined — the corrector may have moved the departure
+    /// epoch and the leg flight times, so this is the schedule that was flown.
+    pub genome: Genome,
+    /// Patch epochs of the refined schedule: departure, each flyby, arrival.
+    pub epochs: Vec<Epoch>,
 }
 
-/// Multi-leg shooting: differential-correct each Lambert leg under the full
-/// n-body dynamics so it lands on its patch body at the patch epoch. The
-/// arrival body's own gravity is excluded per leg (the flyby hyperbola inside
-/// its SOI is the flyby model's job — standard patched-n-body formulation);
-/// every other body pulls. Patch positions/times stay fixed at the scouted
-/// solution — this polishes the *paths*, not the schedule.
+/// Multi-leg shooting: differential-correct each leg under the full n-body
+/// dynamics so it lands on its patch body at the patch epoch. The arrival
+/// body's own gravity is excluded per leg (the flyby hyperbola inside its SOI
+/// is the flyby model's job — standard patched-n-body formulation); every
+/// other body pulls.
+///
+/// Unlike the earlier version, the patch *schedule* is not frozen: the
+/// departure epoch and leg flight times are first re-optimized on the conic
+/// model (see [`optimize_patch_epochs`]), and a leg carrying a deep-space
+/// maneuver is shot in two segments — coast to the maneuver point, then
+/// correct the post-burn velocity onto the arrival node — so the DSM Δv
+/// reported here is the one the real dynamics demand, not the conic estimate.
 pub fn refine_tour(
     eph: &Ephemeris,
     cfg: &SolverConfig,
@@ -1527,30 +1827,23 @@ pub fn refine_tour(
     g: &Genome,
 ) -> Option<RefinedTour> {
     let mu = BodyId::Sun.gm();
-    let (seq, epochs, states) = tour_nodes(eph, cfg, epoch0, g);
+    // Let the corrector move the flyby epochs before committing to paths.
+    let g = optimize_patch_epochs(eph, cfg, epoch0, g);
+    let (seq, epochs, states) = tour_nodes(eph, cfg, epoch0, &g);
     let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 
-    // Initial guesses: the same Lambert arcs the scout used.
-    let mut legs_v: Vec<[f64; 3]> = Vec::with_capacity(g.legs.len());
+    // Initial guesses: the same conic arcs (DSM included) the scout scored.
+    let mut arcs: Vec<LegArc> = Vec::with_capacity(g.legs.len());
     for (i, tof) in g.legs.iter().enumerate() {
-        let (r1, r2) = (states[i].pos_km, states[i + 1].pos_km);
-        let tof_s = tof * DAY_S;
-        let mut options: Vec<([f64; 3], [f64; 3])> = Vec::new();
-        options.extend(lambert_rev(r1, r2, tof_s, mu, 0, false));
-        if *tof > 550.0 {
-            options.extend(lambert_rev(r1, r2, tof_s, mu, 1, false));
-            options.extend(lambert_rev(r1, r2, tof_s, mu, 1, true));
-        }
-        let vref = states[i].vel_km_s;
-        let best = options.into_iter().min_by(|a, b| {
-            let cost = |o: &([f64; 3], [f64; 3])| {
-                let d = sub(o.0, vref);
-                d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
-            };
-            cost(a).total_cmp(&cost(b))
-        })?;
-        legs_v.push(best.0);
+        arcs.push(solve_leg(
+            states[i].pos_km,
+            states[i + 1].pos_km,
+            tof * DAY_S,
+            mu,
+            states[i].vel_km_s,
+            g.leg_dsm(i),
+        )?);
     }
 
     let dyn_cfg = DynamicsConfig {
@@ -1562,6 +1855,7 @@ pub fn refine_tour(
     let mut end_vels: Vec<[f64; 3]> = Vec::new();
     let mut start_vels: Vec<[f64; 3]> = Vec::new();
     let mut worst_miss = 0.0f64;
+    let mut dsm_total = 0.0f64;
 
     for i in 0..g.legs.len() {
         let body_from = seq[i];
@@ -1574,7 +1868,7 @@ pub fn refine_tour(
         // Launch from the start body's SOI along the leg's initial velocity
         // direction relative to the body (fixed for the whole correction, so
         // the Jacobian stays clean).
-        let vrel0 = sub(legs_v[i], states[i].vel_km_s);
+        let vrel0 = sub(arcs[i].v_start, states[i].vel_km_s);
         let vrn = norm(vrel0).max(1e-6);
         let soi = soi_km(eph, body_from, epochs[i]).min(2.0e6);
         let start_pos = [
@@ -1582,75 +1876,62 @@ pub fn refine_tour(
             states[i].pos_km[1] + vrel0[1] / vrn * soi,
             states[i].pos_km[2] + vrel0[2] / vrn * soi,
         ];
-        let tof = epochs[i + 1] - epochs[i];
         let target_pos = states[i + 1].pos_km;
+
+        // Where the corrected segment starts, and with what seed velocity. A
+        // ballistic leg shoots from the SOI over the whole TOF; a DSM leg
+        // coasts the pre-burn segment first (its endpoint is free, so nothing
+        // to correct there) and shoots only the post-burn segment.
+        let (seg_epoch, seg_pos, seg_v0, pre) = match arcs[i].dsm {
+            None => (epochs[i], start_pos, arcs[i].v_start, None),
+            Some((t1, _, vm_req)) => {
+                let coast = dynamics::propagate(
+                    eph,
+                    &leg_dyn,
+                    epochs[i],
+                    ScState { pos: start_pos, vel: arcs[i].v_start },
+                    Duration::from_seconds(t1),
+                    240,
+                );
+                let (e_m, s_m) = *coast.last().unwrap();
+                (e_m, s_m.pos, vm_req, Some((coast, s_m.vel)))
+            }
+        };
+        let seg_tof = epochs[i + 1] - seg_epoch;
 
         let shoot = |v: [f64; 3]| -> [f64; 3] {
             let leg = dynamics::propagate(
                 eph,
                 &leg_dyn,
-                epochs[i],
-                ScState { pos: start_pos, vel: v },
-                tof,
+                seg_epoch,
+                ScState { pos: seg_pos, vel: v },
+                seg_tof,
                 2,
             );
-            let sf = leg.last().unwrap().1;
-            sub(sf.pos, target_pos)
+            sub(leg.last().unwrap().1.pos, target_pos)
         };
-
-        let mut v = legs_v[i];
-        let mut f = shoot(v);
-        for _ in 0..5 {
-            if norm(f) < 300.0 {
-                break;
-            }
-            const H: f64 = 1e-4;
-            let mut jac = [[0.0f64; 3]; 3];
-            for c in 0..3 {
-                let mut vp = v;
-                vp[c] += H;
-                let fp = shoot(vp);
-                for r in 0..3 {
-                    jac[r][c] = (fp[r] - f[r]) / H;
-                }
-            }
-            let det = jac[0][0] * (jac[1][1] * jac[2][2] - jac[1][2] * jac[2][1])
-                - jac[0][1] * (jac[1][0] * jac[2][2] - jac[1][2] * jac[2][0])
-                + jac[0][2] * (jac[1][0] * jac[2][1] - jac[1][1] * jac[2][0]);
-            if det.abs() < 1e-12 {
-                break;
-            }
-            let rhs = [-f[0], -f[1], -f[2]];
-            let solve_col = |col: usize| {
-                let mut m = jac;
-                for r in 0..3 {
-                    m[r][col] = rhs[r];
-                }
-                (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-                    - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-                    + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
-                    / det
-            };
-            let dv = [solve_col(0), solve_col(1), solve_col(2)];
-            let dvn = norm(dv);
-            let scale = if dvn > 1.0 { 1.0 / dvn } else { 1.0 };
-            for c in 0..3 {
-                v[c] += dv[c] * scale;
-            }
-            f = shoot(v);
-        }
-        worst_miss = worst_miss.max(norm(f));
+        let (v, miss) = newton_shoot(&shoot, seg_v0, 5, 300.0);
+        worst_miss = worst_miss.max(miss);
 
         // Dense pass for rendering + the arrival velocity.
         let dense = dynamics::propagate(
             eph,
             &leg_dyn,
-            epochs[i],
-            ScState { pos: start_pos, vel: v },
-            tof,
+            seg_epoch,
+            ScState { pos: seg_pos, vel: v },
+            seg_tof,
             240,
         );
-        start_vels.push(v);
+        match pre {
+            Some((coast, v_before)) => {
+                // The burn is whatever the corrected post-burn velocity asks
+                // for over what the coast actually delivered.
+                dsm_total += norm(sub(v, v_before));
+                traj.extend_from_slice(&coast);
+            }
+            None => {}
+        }
+        start_vels.push(arcs[i].v_start);
         end_vels.push(dense.last().unwrap().1.vel);
         traj.extend_from_slice(&dense);
     }
@@ -1697,9 +1978,12 @@ pub fn refine_tour(
             states.last().unwrap().vel_km_s,
         )),
         assist_dv_kms: assist_dv,
+        dsm_dv_kms: dsm_total,
         worst_miss_km: worst_miss,
         flybys,
         traj,
+        genome: g,
+        epochs,
     })
 }
 
