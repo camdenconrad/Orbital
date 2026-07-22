@@ -451,6 +451,73 @@ fn rediscovers_mars_2020_trajectory() {
     assert!((11.0..18.0).contains(&c3), "C3 {c3}");
 }
 
+/// Fresh ballistic seeds must not be sampled *conditional* on low C3: an
+/// explicit uniform channel has to survive alongside the launch-feasible one,
+/// or timing regions with good arrival v∞ / short TOF but moderate C3 become
+/// unreachable (see issue #12). Also checks the feasible-draw rate is recorded
+/// rather than the distribution being silently replaced.
+#[test]
+fn fresh_seeds_keep_a_uniform_timing_channel() {
+    use crate::solver::{Search, SolverConfig};
+    let (eph, label) = Ephemeris::load();
+    if !require_kernels(&label, "SPICE") {
+        return;
+    }
+    let cfg = SolverConfig::default();
+    let cap = cfg.launcher.c3_max();
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2020, 1, 1);
+    let s = Search::new(&eph, cfg, epoch0, None);
+    let stats = s.seed_draw_stats();
+    println!("{stats:?} feasible rate {:.3}", stats.feasible_rate());
+
+    // The rate is measured over untouched uniform draws, so it must be well
+    // under 1 — Lambert aims at arbitrary (departure, TOF) pairs mostly bust
+    // any real launcher cap.
+    assert!(stats.draws > 0, "no timing draws recorded");
+    assert!(stats.feasible_rate() < 0.75, "rate {}", stats.feasible_rate());
+    assert!(stats.uniform_genomes > 0, "uniform seed channel is empty");
+    assert!(stats.feasible_genomes > 0, "feasible seed channel is empty");
+
+    // ...and the uniform channel must actually reach past the cap in the beam.
+    let over = s
+        .beam_genomes()
+        .iter()
+        .filter(|g| {
+            let v = g.vinf_dep;
+            v[0] * v[0] + v[1] * v[1] + v[2] * v[2] > cap
+        })
+        .count();
+    assert!(over > 0, "every fresh seed landed under the C3 cap: {over}");
+}
+
+/// RNG consumption during seeding must not depend on Lambert reachability:
+/// the feasible-channel batch is always drawn in full, so the number of timing
+/// draws is a pure function of the config (docs/DETERMINISM.md).
+#[test]
+fn seed_rng_consumption_is_data_independent() {
+    use crate::solver::{Search, SolverConfig, SEED_DRAWS};
+    let (eph, label) = Ephemeris::load();
+    if !require_kernels(&label, "SPICE") {
+        return;
+    }
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2020, 1, 1);
+    let mut expected = None;
+    // Very different launcher caps => very different feasible-draw rates; the
+    // draw *count* must be identical either way.
+    for launcher in crate::solver::Launcher::ALL {
+        let mut cfg = SolverConfig::default();
+        cfg.launcher = launcher;
+        let width = cfg.beam_width;
+        let s = Search::new(&eph, cfg, epoch0, None);
+        let draws = s.seed_draw_stats().draws;
+        assert_eq!(draws, width * SEED_DRAWS, "{}", launcher.label());
+        if let Some(e) = expected {
+            assert_eq!(draws, e, "RNG consumption shifted with launcher cap");
+        }
+        expected = Some(draws);
+    }
+}
+
 /// Universal-variable Kepler propagation must round-trip: forward dt then
 /// backward dt returns the initial state.
 #[test]

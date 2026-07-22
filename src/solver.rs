@@ -1336,7 +1336,41 @@ pub struct Search {
     leg_bounds: Vec<(f64, f64)>,
     rng: Rng,
     beam: Vec<(f64, Genome)>,
+    /// Seed-channel telemetry: (uniform-channel draws, launch-feasible draws,
+    /// total timing draws made). Records how often a uniform timing draw is
+    /// launcher-feasible instead of silently replacing the distribution.
+    seed_draws: SeedDrawStats,
 }
+
+/// Counts of timing draws by seed channel, for diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeedDrawStats {
+    /// Genomes seeded from the uniform channel (timing kept as drawn).
+    pub uniform_genomes: usize,
+    /// Genomes seeded from the launch-feasible channel.
+    pub feasible_genomes: usize,
+    /// Feasible-channel genomes where no draw in the batch met the C3 cap, so
+    /// the cheapest draw was kept as a fallback.
+    pub feasible_misses: usize,
+    /// Individual timing draws evaluated for launcher feasibility.
+    pub draws: usize,
+    /// How many of those were within the launcher's C3 cap.
+    pub draws_feasible: usize,
+}
+
+impl SeedDrawStats {
+    /// Fraction of uniform timing draws that a real launcher could fly.
+    pub fn feasible_rate(&self) -> f64 {
+        if self.draws == 0 {
+            return f64::NAN;
+        }
+        self.draws_feasible as f64 / self.draws as f64
+    }
+}
+
+/// Timing draws taken per feasible-channel seed. Fixed, and always fully
+/// consumed, so RNG consumption never depends on Lambert reachability.
+pub const SEED_DRAWS: usize = 12;
 
 const SAMPLES: usize = 40;
 
@@ -1374,6 +1408,7 @@ impl Search {
             leg_bounds,
             rng,
             beam: Vec::new(),
+            seed_draws: SeedDrawStats::default(),
         };
         let mut beam: Vec<(f64, Genome)> = (0..beam_width)
             .map(|_| {
@@ -1384,6 +1419,16 @@ impl Search {
         beam.sort_by(|a, b| a.0.total_cmp(&b.0));
         s.beam = beam;
         s
+    }
+
+    /// The current beam's genomes, best-first.
+    pub fn beam_genomes(&self) -> Vec<Genome> {
+        self.beam.iter().map(|(_, g)| g.clone()).collect()
+    }
+
+    /// Seed-channel telemetry, including the launcher-feasible draw rate.
+    pub fn seed_draw_stats(&self) -> SeedDrawStats {
+        self.seed_draws
     }
 
     fn eval_score(&self, g: &Genome) -> f64 {
@@ -1453,29 +1498,59 @@ impl Search {
         let ballistic_direct = self.cfg.route.is_empty() && !sep;
         // Ballistic direct seeds are Lambert-aimed, and a Lambert aim for an
         // arbitrary (departure, TOF) pair routinely wants C3 far past the
-        // launcher's cap — `mission_score` now charges that as infeasible, so
-        // such a seed is dropped from the beam on arrival and the fresh-seed
+        // launcher's cap — `mission_score` charges that as infeasible, so such
+        // a seed is dropped from the beam on arrival and the fresh-seed
         // channel stops contributing. Scaling the v∞ down would keep the
-        // candidate but destroy the aim (it is no longer an intercept), so
-        // instead resample the *timing* and keep the cheapest draw: the search
-        // then seeds inside the real launch windows, which is exactly where
-        // the flyable transfers live.
+        // candidate but destroy the aim (it is no longer an intercept). So run
+        // two explicit channels instead of quietly reshaping one distribution:
+        //
+        //   - uniform: timing kept exactly as drawn, so short-TOF / good
+        //     arrival-v∞ regions with moderate C3 stay reachable (they matter
+        //     under the TimeOfFlight and ArrivalVinf objectives, where C3 is
+        //     not the goal);
+        //   - launch-feasible: a batch of SEED_DRAWS draws, one of the
+        //     launcher-feasible ones picked *uniformly* (not the first, and
+        //     not the min-C3 order statistic), falling back to the cheapest
+        //     draw when the batch finds none.
+        //
+        // The batch is always drawn in full and the channel/pick selectors are
+        // always consumed, so RNG consumption is a function of the config
+        // alone — a change in Lambert reachability no longer shifts the whole
+        // deterministic sequence (docs/DETERMINISM.md).
         let (depart_days, legs) = if ballistic_direct {
-            let mut best: Option<(f64, f64, Vec<f64>)> = None;
-            for _ in 0..12 {
+            let uniform_channel = self.rng.below(3) == 0;
+            let pick = self.rng.below(SEED_DRAWS);
+            let mut draws: Vec<(f64, f64, Vec<f64>)> = Vec::with_capacity(SEED_DRAWS);
+            for _ in 0..SEED_DRAWS {
                 let (d, l) = self.draw_timing(sep);
                 let c3 = self
                     .lambert_vinf(d, l[0])
                     .map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
                     .unwrap_or(f64::INFINITY);
-                if best.as_ref().is_none_or(|(b, ..)| c3 < *b) {
-                    best = Some((c3, d, l));
-                }
-                if c3 <= self.cfg.launcher.c3_max() {
-                    break;
-                }
+                draws.push((c3, d, l));
             }
-            let (_, d, l) = best.unwrap();
+            let cap = self.cfg.launcher.c3_max();
+            let feasible: Vec<usize> = (0..SEED_DRAWS).filter(|&i| draws[i].0 <= cap).collect();
+            self.seed_draws.draws += SEED_DRAWS;
+            self.seed_draws.draws_feasible += feasible.len();
+            let idx = if uniform_channel {
+                self.seed_draws.uniform_genomes += 1;
+                // The first draw is an untouched uniform sample.
+                0
+            } else {
+                self.seed_draws.feasible_genomes += 1;
+                if feasible.is_empty() {
+                    self.seed_draws.feasible_misses += 1;
+                    // Nothing flyable in the batch: keep the cheapest, which is
+                    // still the best available lead into a launch window.
+                    (0..SEED_DRAWS)
+                        .min_by(|&a, &b| draws[a].0.total_cmp(&draws[b].0))
+                        .unwrap()
+                } else {
+                    feasible[pick % feasible.len()]
+                }
+            };
+            let (_, d, l) = draws.swap_remove(idx);
             (d, l)
         } else {
             self.draw_timing(sep)
