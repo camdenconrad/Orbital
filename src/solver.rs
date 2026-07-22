@@ -1762,6 +1762,25 @@ pub fn auto_search(
     budget: AutoBudget,
 ) -> u64 {
     let routes = candidate_routes(cfg.target);
+    // One shared ephemeris table for every route. Each Search would otherwise
+    // build its own (a full threaded SPK sampling pass) — ~40 of them. Sizing
+    // the span to the longest route's max TOF is behaviour-preserving: the
+    // sample step and t0 are unchanged, so a shorter route reads exactly the
+    // same sample values, just from a longer table.
+    let max_tof = routes
+        .iter()
+        .map(|r| {
+            let mut c = cfg.clone();
+            c.route = r.clone();
+            c.max_total_tof_days()
+        })
+        .fold(0.0f64, f64::max);
+    let dyn_cfg = solver_dynamics();
+    let shared_eph = Arc::new(eph.cached_span(
+        epoch0 - Duration::from_days(1.0),
+        epoch0 + Duration::from_days(cfg.window_days + max_tof + 2.0),
+        &dyn_cfg.perturbers,
+    ));
     let mut evals = 0u64;
     let mut best_score = f64::INFINITY;
     let mut pool: Vec<(f64, Search)> = Vec::new();
@@ -1803,7 +1822,7 @@ pub fn auto_search(
         let mut c = cfg.clone();
         c.route = route.clone();
         c.auto_route = false;
-        let mut search = Search::new(eph, c, epoch0, None);
+        let mut search = Search::new(eph, c, epoch0, Some(shared_eph.clone()));
         let mut local = f64::INFINITY;
         // Longer routes have a bigger timing space — give them proportionally
         // more screening budget or multi-leg tours never show their value.
@@ -1829,7 +1848,7 @@ pub fn auto_search(
         }
         let mut c2 = search.cfg.clone();
         c2.seed = c2.seed.wrapping_add(1000);
-        let mut alt = Search::new(eph, c2, epoch0, None);
+        let mut alt = Search::new(eph, c2, epoch0, Some(shared_eph.clone()));
         let mut alt_local = f64::INFINITY;
         if !drive(&mut alt, budget.refine, &mut alt_local, &mut evals, &mut best_score, on_best, keep_running) {
             return evals;

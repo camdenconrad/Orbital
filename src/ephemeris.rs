@@ -96,8 +96,7 @@ impl Ephemeris {
         match self {
             #[cfg(feature = "spice")]
             Ephemeris::Spice { almanac, covered } => {
-                let idx = ALL_BODIES.iter().position(|b| *b == body).unwrap();
-                if covered[idx] {
+                if covered[body.index()] {
                     if let Some(s) = try_spice(almanac, body, epoch) {
                         return s;
                     }
@@ -106,8 +105,7 @@ impl Ephemeris {
             }
             Ephemeris::Kepler => kepler_state(self, body, epoch),
             Ephemeris::Cached(span) => {
-                let idx = ALL_BODIES.iter().position(|b| *b == body).unwrap();
-                match &span.tables[idx] {
+                match &span.tables[body.index()] {
                     Some((step_s, table)) => span.interp(*step_s, table, epoch),
                     None => kepler_state(self, body, epoch),
                 }
