@@ -165,6 +165,15 @@ fn save_mission(sol: &solver::Solution, cfg: &SolverConfig) {
             .collect::<Vec<_>>()
             .join(",")
     );
+    s += &format!(
+        "dsm={}\n",
+        sol.genome
+            .dsm
+            .iter()
+            .map(|d| format!("{:e}:{:e}:{:e}:{:e}", d[0], d[1], d[2], d[3]))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     if let Err(e) = std::fs::write(MISSION_FILE, s) {
         eprintln!("could not save {MISSION_FILE}: {e}");
     }
@@ -178,6 +187,7 @@ fn load_mission() -> Option<(SolverConfig, solver::Genome, Epoch)> {
     let mut legs = Vec::new();
     let mut vinf = [0.0f64; 3];
     let mut thrust = Vec::new();
+    let mut dsm = Vec::new();
     let mut depart = None;
     let body = |n: &str| ALL_BODIES.iter().find(|b| b.name().eq_ignore_ascii_case(n)).copied();
     for line in text.lines() {
@@ -223,6 +233,14 @@ fn load_mission() -> Option<(SolverConfig, solver::Genome, Epoch)> {
                     }
                 }
             }
+            "dsm" => {
+                for node in v.split(',').filter(|s| !s.is_empty()) {
+                    let p: Vec<f64> = node.split(':').filter_map(|x| x.parse().ok()).collect();
+                    if p.len() == 4 {
+                        dsm.push([p[0], p[1], p[2], p[3]]);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -237,6 +255,7 @@ fn load_mission() -> Option<(SolverConfig, solver::Genome, Epoch)> {
             legs,
             vinf_dep: vinf,
             thrust,
+            dsm,
         },
         depart,
     ))
@@ -822,7 +841,14 @@ impl App {
             "duration".into(),
             format!("{:.1} yr ({days:.0} d)", days / 365.25),
         ));
-        let total = sol.assist_dv_kms + sol.thrust_dv_kms + sol.arrival_dv_kms;
+        if sol.dsm_dv_kms > 0.001 {
+            rows.push((
+                "deep-space maneuvers".into(),
+                format!("Δv {:.2} km/s", sol.dsm_dv_kms),
+            ));
+        }
+        let total =
+            sol.assist_dv_kms + sol.thrust_dv_kms + sol.dsm_dv_kms + sol.arrival_dv_kms;
         rows.push(("post-launch Δv".into(), format!("{total:.2} km/s")));
 
         egui::Grid::new("mission-plan")
@@ -1640,11 +1666,21 @@ impl eframe::App for App {
                         sol.vinf_dep_kms = rt.vinf_dep_kms;
                         sol.vinf_arr_kms = rt.vinf_arr_kms;
                         sol.assist_dv_kms = rt.assist_dv_kms;
+                        sol.dsm_dv_kms = rt.dsm_dv_kms;
+                        // The corrector is allowed to move patch epochs, so
+                        // the schedule it flew — not the scouted one — is the
+                        // mission.
+                        sol.genome = rt.genome.clone();
+                        sol.depart = rt.epochs[0];
+                        sol.arrive = *rt.epochs.last().unwrap();
                     }
                     let mut info = format!(
                         "n-body tour: v∞ dep {:.2} arr {:.2} · assist Δv {:.2} km/s",
                         rt.vinf_dep_kms, rt.vinf_arr_kms, rt.assist_dv_kms
                     );
+                    if rt.dsm_dv_kms > 0.001 {
+                        info += &format!(" · DSM Δv {:.2} km/s", rt.dsm_dv_kms);
+                    }
                     for f in &rt.flybys {
                         let (y, mo, d, ..) = f.epoch.to_gregorian_utc();
                         info += &format!(

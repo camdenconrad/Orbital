@@ -111,3 +111,20 @@ guarantees are unaffected.
   retrograde/high-inclination transfers not searched.
 - All 21 catalog bodies are now SPICE-covered: de440s + jup365 + sat441 +
   nep097 + codes_300ast (asteroids).
+
+## Running the validation suite
+
+`cargo test --release`. The validation tests need the real SPICE kernels in
+`data/` (~32 MB); without them the ephemeris falls back to the analytic Kepler
+model and the results mean nothing.
+
+Those tests therefore **fail loudly** when the kernels are absent rather than
+skipping — a silently-skipped `rediscovers_mars_2020_trajectory` is a green
+suite that validates nothing, and that has already let a real regression
+through. If an environment genuinely cannot carry the kernels, set
+
+    ORBITAL_ALLOW_SKIP_SPICE=1
+
+to downgrade the failure to a skip (each skipped test prints a `SKIPPING:`
+line naming the ephemeris it actually loaded). Never set it in CI that is
+meant to gate correctness.

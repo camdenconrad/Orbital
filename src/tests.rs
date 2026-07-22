@@ -10,6 +10,32 @@ fn j2000() -> Epoch {
     Epoch::from_gregorian_utc_at_midnight(2000, 1, 1)
 }
 
+/// Guard for tests that need the real SPICE kernels in `data/`.
+///
+/// These are the project's load-bearing validation tests. Silently returning
+/// when the kernels are missing makes them PASS vacuously, which has already
+/// hidden a real regression — so absence is a hard failure by default. Set
+/// `ORBITAL_ALLOW_SKIP_SPICE=1` only in environments that genuinely cannot
+/// carry the 32 MB kernels; the test then skips and says so.
+#[must_use]
+fn require_kernels(label: &str, needle: &str) -> bool {
+    if label.contains(needle) {
+        return true;
+    }
+    if std::env::var("ORBITAL_ALLOW_SKIP_SPICE").as_deref() == Ok("1") {
+        eprintln!(
+            "SKIPPING: kernels absent (loaded {label:?}, need {needle:?}); \
+             ORBITAL_ALLOW_SKIP_SPICE=1 is set"
+        );
+        return false;
+    }
+    panic!(
+        "SPICE kernels absent: ephemeris loaded as {label:?}, need {needle:?}. \
+         This validation test cannot run without data/de440s.bsp. Fetch the \
+         kernels, or set ORBITAL_ALLOW_SKIP_SPICE=1 to skip (see docs/VALIDATION.md)."
+    );
+}
+
 #[test]
 fn earth_is_about_one_au_out() {
     let eph = Ephemeris::Kepler;
@@ -113,8 +139,7 @@ fn mercury_perihelion_advance() {
 #[test]
 fn spice_and_kepler_agree() {
     let (eph, label) = Ephemeris::load();
-    if !label.starts_with("DE440s") {
-        eprintln!("de440s.bsp not present; skipping");
+    if !require_kernels(&label, "de440s.bsp") {
         return;
     }
     let kepler = Ephemeris::Kepler;
@@ -401,8 +426,7 @@ fn lambert_conserves_and_matches_hohmann() {
 fn rediscovers_mars_2020_trajectory() {
     use crate::solver::{Search, SolverConfig};
     let (eph, label) = Ephemeris::load();
-    if !label.starts_with("SPICE") {
-        eprintln!("kernels absent; skipping");
+    if !require_kernels(&label, "SPICE") {
         return;
     }
     let cfg = SolverConfig::default();
@@ -474,6 +498,192 @@ fn lambert_multirev_recovers_same_ellipse() {
     assert!(matched, "no branch recovered the original ellipse: {candidates:?} vs {v1:?}");
 }
 
+/// `lambert_best` must actually find multi-revolution transfers, not just the
+/// direct arc. Construct a known m-rev transfer by flying a real ellipse: take
+/// the single-rev solution's conic and ask for the *same* endpoints m extra
+/// periods later. A solver that only ever tries revs=0 cannot solve that TOF
+/// at all (the geometry needs > 2π of sweep), so recovering the ellipse for
+/// every m is proof the sweep is real.
+#[test]
+fn lambert_best_finds_known_multirev_transfers() {
+    use crate::solver::{lambert, lambert_best};
+    let mu = BodyId::Sun.gm();
+    let r1v = [1.0 * AU_KM, 0.0, 0.0];
+    let th = 120f64.to_radians();
+    let r2v = [1.4 * AU_KM * th.cos(), 1.4 * AU_KM * th.sin(), 0.0];
+    let tof = 200.0 * 86_400.0;
+    let (v1, _) = lambert(r1v, r2v, tof, mu).expect("single rev");
+    let v1n2 = v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2];
+    let a = 1.0 / (2.0 / AU_KM - v1n2 / mu);
+    let period = 2.0 * std::f64::consts::PI * (a * a * a / mu).sqrt();
+
+    // The known ellipse leaves r1 with exactly v1. Ask for it back by making
+    // v1 the reference velocity: only an m-rev sweep can return it, because
+    // the m-rev arc *is* this ellipse flown m extra times around.
+    for m in 1..=4 {
+        let t = tof + m as f64 * period;
+        let (w1, _) = lambert_best(r1v, r2v, t, mu, v1)
+            .unwrap_or_else(|| panic!("m={m}: lambert_best found no arc"));
+        for k in 0..3 {
+            assert!(
+                (w1[k] - v1[k]).abs() < 0.05,
+                "m={m}: did not recover the known ellipse on axis {k}: {} vs {}",
+                w1[k],
+                v1[k]
+            );
+        }
+        // The arc must be a real conic through both endpoints.
+        let (rf, _) = crate::solver::kepler_universal(r1v, w1, t, mu);
+        for k in 0..3 {
+            assert!(
+                (rf[k] - r2v[k]).abs() < 1e5,
+                "m={m}: arc misses the arrival point on axis {k}: {} vs {}",
+                rf[k],
+                r2v[k]
+            );
+        }
+        // Sanity that this is genuinely the multi-rev branch and not the
+        // single-rev arc in disguise: the 0-rev solution for the same TOF is
+        // a much slower, much bigger ellipse.
+        let (v0, _) = crate::solver::lambert_rev(r1v, r2v, t, mu, 0, false)
+            .expect("0-rev arc exists too");
+        let sma = |v: [f64; 3]| {
+            1.0 / (2.0 / AU_KM - (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) / mu)
+        };
+        assert!(
+            sma(v0) > 1.2 * sma(w1),
+            "m={m}: 0-rev arc was not distinguishably larger ({} vs {})",
+            sma(v0),
+            sma(w1)
+        );
+    }
+}
+
+/// The revolution ceiling must come from geometry, not a hardcoded TOF: a leg
+/// far too short for even one extra revolution admits none, while a very long
+/// one admits several.
+#[test]
+fn multirev_ceiling_scales_with_time_of_flight() {
+    use crate::solver::lambert_best;
+    let mu = BodyId::Sun.gm();
+    let r1v = [1.0 * AU_KM, 0.0, 0.0];
+    let r2v = [0.0, 1.2 * AU_KM, 0.0];
+    // 100 days is well under one transfer period — only the direct arc exists.
+    let short = lambert_best(r1v, r2v, 100.0 * 86_400.0, mu, [0.0; 3]);
+    assert!(short.is_some(), "direct arc should still solve");
+    // The old hardcoded gate was tof > 550 d. A 500-day leg is below it but
+    // is more than a transfer period, so multi-rev arcs do exist there — this
+    // is exactly what the magic constant used to hide.
+    let mid = 500.0 * 86_400.0;
+    let multi_exists = (1..=4).any(|m| {
+        [false, true]
+            .iter()
+            .any(|hb| crate::solver::lambert_rev(r1v, r2v, mid, mu, m, *hb).is_some())
+    });
+    assert!(multi_exists, "no multi-rev arc below the old 550-day gate");
+    // And lambert_best must be picking the cheapest of everything available:
+    // never worse (w.r.t. its vref cost) than the plain single-rev arc.
+    let vref = [0.0, 30.0, 0.0];
+    let best = lambert_best(r1v, r2v, mid, mu, vref).expect("some arc");
+    let cost = |v: [f64; 3]| {
+        (0..3).map(|k| (v[k] - vref[k]).powi(2)).sum::<f64>()
+    };
+    if let Some((v0, _)) = crate::solver::lambert_rev(r1v, r2v, mid, mu, 0, false) {
+        assert!(
+            cost(best.0) <= cost(v0) + 1e-9,
+            "lambert_best returned a worse arc than plain single-rev"
+        );
+    }
+}
+
+/// A DSM-enabled tour must score no worse than the same tour flown ballistic.
+/// The parameterization is built so an inert node (zero Δv) is bit-for-bit the
+/// ballistic leg, and the search only ever turns one on if it pays — so the
+/// beam with DSMs available must never end up behind the beam without them.
+#[test]
+fn dsm_tour_scores_no_worse_than_ballistic() {
+    use crate::solver::{Genome, Search, SolverConfig};
+    let (eph, _) = Ephemeris::load();
+    let mut cfg = SolverConfig::default();
+    cfg.target = BodyId::Jupiter;
+    cfg.route = vec![BodyId::Venus, BodyId::Earth];
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2028, 1, 1);
+
+    let run = |strip: bool| -> (f64, Genome) {
+        let mut s = Search::new(&eph, cfg.clone(), epoch0, None);
+        let mut top = None;
+        for _ in 0..60 {
+            let (_, t) = s.step(&eph);
+            top = Some(t);
+        }
+        let (score, mut g) = top.unwrap();
+        if strip {
+            // Score the very same schedule with the maneuvers removed.
+            g.dsm.clear();
+            return (s.solution_for(&eph, &g).score, g);
+        }
+        (score, g)
+    };
+
+    let (with_dsm, g) = run(false);
+    assert!(with_dsm < 1e3, "no feasible tour found, score {with_dsm}");
+
+    // 1. An inert DSM node is exactly the ballistic leg — no drift, no cost.
+    let mut inert = g.clone();
+    inert.dsm = vec![[0.5, 0.0, 0.0, 0.0]; inert.legs.len()];
+    let mut bare = g.clone();
+    bare.dsm.clear();
+    let s_inert = crate::solver::evaluate_saved(&eph, &cfg, epoch0, &inert).score;
+    let s_bare = crate::solver::evaluate_saved(&eph, &cfg, epoch0, &bare).score;
+    assert_eq!(
+        s_inert, s_bare,
+        "an inert DSM node changed the score ({s_inert} vs {s_bare})"
+    );
+
+    // 2. Whatever the search settled on, it beats the same schedule stripped
+    //    of its maneuvers — a DSM is only ever kept when it pays for itself.
+    let stripped = crate::solver::evaluate_saved(&eph, &cfg, epoch0, &bare).score;
+    assert!(
+        with_dsm <= stripped + 1e-9,
+        "DSM tour scored worse than ballistic: {with_dsm} vs {stripped}"
+    );
+
+    // 3. The DSM Δv the solution reports is real and charged, not free.
+    let sol = crate::solver::evaluate_saved(&eph, &cfg, epoch0, &g);
+    assert!(sol.dsm_dv_kms >= 0.0 && sol.dsm_dv_kms < 20.0, "DSM Δv {}", sol.dsm_dv_kms);
+}
+
+/// The corrector must be allowed to move patch epochs, and doing so must not
+/// make the tour worse under the conic model it optimizes against.
+#[test]
+fn patch_epoch_optimization_improves_schedule() {
+    use crate::solver::{optimize_patch_epochs, Search, SolverConfig};
+    let (eph, _) = Ephemeris::load();
+    let mut cfg = SolverConfig::default();
+    cfg.target = BodyId::Mars;
+    cfg.route = vec![BodyId::Venus];
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2028, 1, 1);
+    let mut s = Search::new(&eph, cfg.clone(), epoch0, None);
+    let mut top = None;
+    for _ in 0..30 {
+        let (_, t) = s.step(&eph);
+        top = Some(t);
+    }
+    let (before, g) = top.unwrap();
+    let tuned = optimize_patch_epochs(&eph, &cfg, epoch0, &g);
+    let after = crate::solver::evaluate_saved(&eph, &cfg, epoch0, &tuned).score;
+    assert!(after <= before + 1e-9, "schedule tuning made it worse: {before} -> {after}");
+    // Epochs are genuinely free now — the tuner should have moved *something*
+    // off a randomly-sampled beam schedule.
+    let moved = (tuned.depart_days - g.depart_days).abs() > 1e-9
+        || tuned
+            .legs
+            .iter()
+            .zip(&g.legs)
+            .any(|(a, b)| (a - b).abs() > 1e-9);
+    assert!(moved, "patch epochs stayed frozen");
+}
+
 /// Tour evaluation smoke: a VEEGA search must produce feasible Lambert legs
 /// (score ≪ the failure sentinel) and one Flyby record per route body.
 #[test]
@@ -505,8 +715,7 @@ fn veega_tour_search_is_sane() {
 fn differential_correction_hits_target() {
     use crate::solver::{differential_correct, Search, SolverConfig};
     let (eph, label) = Ephemeris::load();
-    if !label.starts_with("SPICE") {
-        eprintln!("kernels absent; skipping");
+    if !require_kernels(&label, "SPICE") {
         return;
     }
     let cfg = SolverConfig::default();
@@ -541,8 +750,7 @@ fn differential_correction_hits_target() {
 fn tour_refines_to_mission_grade() {
     use crate::solver::{refine_tour, Search, SolverConfig};
     let (eph, label) = Ephemeris::load();
-    if !label.starts_with("SPICE") {
-        eprintln!("kernels absent; skipping");
+    if !require_kernels(&label, "SPICE") {
         return;
     }
     let mut cfg = SolverConfig::default();
@@ -725,8 +933,7 @@ fn low_thrust_changes_orbit_as_expected() {
 fn sep_pluto_search_uses_thrust() {
     use crate::solver::{Engine, Search, SolverConfig};
     let (eph, label) = Ephemeris::load();
-    if !label.starts_with("SPICE") {
-        eprintln!("kernels absent; skipping");
+    if !require_kernels(&label, "SPICE") {
         return;
     }
     let mut cfg = SolverConfig::default();
@@ -770,6 +977,7 @@ fn launcher_c3_cap_binds_on_direct_transfers() {
         legs: vec![250.0],
         vinf_dep: [v, v, v],
         thrust: Vec::new(),
+        dsm: Vec::new(),
     };
     let score_for = |l: Launcher| {
         let cfg = SolverConfig {
@@ -823,6 +1031,7 @@ fn launcher_c3_cap_binds_on_tours() {
                 legs: vec![leg, leg * 1.2],
                 vinf_dep: [0.0; 3],
                 thrust: Vec::new(),
+            dsm: Vec::new(),
             };
             let fh = evaluate_saved(&eph, &base(Launcher::FalconHeavy), epoch0, &g);
             let kick = evaluate_saved(&eph, &base(Launcher::KickStage), epoch0, &g);
@@ -896,6 +1105,7 @@ fn truncated_flights_score_infeasible() {
         legs: vec![250.0],
         vinf_dep: [1.0, 3.0, 0.2],
         thrust: Vec::new(),
+        dsm: Vec::new(),
     };
     let full = solver_dynamics();
     let good = evaluate(&eph, &full, &cfg, depart, &g, 32);
@@ -925,8 +1135,7 @@ fn truncated_flights_score_infeasible() {
 fn differential_correct_honors_target() {
     use crate::solver::{differential_correct, solver_dynamics};
     let (eph, label) = Ephemeris::load();
-    if !label.starts_with("SPICE") {
-        eprintln!("kernels absent; skipping");
+    if !require_kernels(&label, "SPICE") {
         return;
     }
     let full = solver_dynamics();
