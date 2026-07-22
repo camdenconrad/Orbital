@@ -1263,8 +1263,8 @@ impl Search {
         })
     }
 
-    fn random_genome(&mut self) -> Genome {
-        let sep = self.cfg.engine != Engine::Ballistic && self.cfg.route.is_empty();
+    /// One random (departure epoch, leg flight times) draw.
+    fn draw_timing(&mut self, sep: bool) -> (f64, Vec<f64>) {
         let depart_days = self.rng.unit() * self.cfg.window_days;
         let seq = self.cfg.sequence();
         let bounds = self.leg_bounds.clone();
@@ -1291,6 +1291,41 @@ impl Search {
                 }
             })
             .collect();
+        (depart_days, legs)
+    }
+
+    fn random_genome(&mut self) -> Genome {
+        let sep = self.cfg.engine != Engine::Ballistic && self.cfg.route.is_empty();
+        let ballistic_direct = self.cfg.route.is_empty() && !sep;
+        // Ballistic direct seeds are Lambert-aimed, and a Lambert aim for an
+        // arbitrary (departure, TOF) pair routinely wants C3 far past the
+        // launcher's cap — `mission_score` now charges that as infeasible, so
+        // such a seed is dropped from the beam on arrival and the fresh-seed
+        // channel stops contributing. Scaling the v∞ down would keep the
+        // candidate but destroy the aim (it is no longer an intercept), so
+        // instead resample the *timing* and keep the cheapest draw: the search
+        // then seeds inside the real launch windows, which is exactly where
+        // the flyable transfers live.
+        let (depart_days, legs) = if ballistic_direct {
+            let mut best: Option<(f64, f64, Vec<f64>)> = None;
+            for _ in 0..12 {
+                let (d, l) = self.draw_timing(sep);
+                let c3 = self
+                    .lambert_vinf(d, l[0])
+                    .map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+                    .unwrap_or(f64::INFINITY);
+                if best.as_ref().is_none_or(|(b, ..)| c3 < *b) {
+                    best = Some((c3, d, l));
+                }
+                if c3 <= self.cfg.launcher.c3_max() {
+                    break;
+                }
+            }
+            let (_, d, l) = best.unwrap();
+            (d, l)
+        } else {
+            self.draw_timing(sep)
+        };
         let vinf_dep = if !self.cfg.route.is_empty() {
             [0.0; 3] // tours derive v∞ from the first Lambert leg
         } else if sep && self.rng.below(2) == 0 {
@@ -1499,7 +1534,10 @@ pub fn differential_correct(
 ) -> ([f64; 3], f64) {
     let arrive = depart + tof;
     let tgt = eph.state(target, arrive);
-    let shoot = |vinf: [f64; 3]| -> [f64; 3] {
+    // `None` when the propagation truncated (step exhaustion): the trajectory's
+    // last point is then an early cutoff, not the arrival state, so using it
+    // would feed a residual for the wrong epoch into the Jacobian.
+    let shoot = |vinf: [f64; 3]| -> Option<[f64; 3]> {
         let g = Genome {
             depart_days: 0.0,
             legs: vec![tof.to_seconds() / DAY_S],
@@ -1515,28 +1553,45 @@ pub fn differential_correct(
             ..Default::default()
         };
         let sol = evaluate_direct(eph, dyn_cfg, &cfg, depart, &g, 2);
+        if !sol.miss_km.is_finite() {
+            return None; // truncated: `infeasible` marks it with an infinite miss
+        }
         let sf = sol.traj.last().unwrap().1;
-        [
+        Some([
             sf.pos[0] - tgt.pos_km[0],
             sf.pos[1] - tgt.pos_km[1],
             sf.pos[2] - tgt.pos_km[2],
-        ]
+        ])
     };
     let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
 
     let mut vinf = vinf0;
-    let mut f = shoot(vinf);
-    for _ in 0..9 {
-        if norm(f) < 500.0 {
+    let Some(mut f) = shoot(vinf) else {
+        return (vinf0, f64::INFINITY);
+    };
+    // Newton on an adaptively-integrated arc is not monotone: the step-size
+    // controller makes the residual jitter by ~1e3 km under sub-m/s input
+    // changes, so a late iterate can be far worse than an early one. Keep the
+    // best iterate seen and return that rather than wherever the walk ended.
+    let (mut best_vinf, mut best_norm) = (vinf, norm(f));
+    for _ in 0..30 {
+        if best_norm < 500.0 {
             break;
         }
-        // Finite-difference Jacobian dF/dv∞, column per component.
-        const H: f64 = 1e-4;
+        // Finite-difference Jacobian dF/dv∞, column per component. H must be
+        // large enough that the induced arrival displacement clears that same
+        // integrator jitter: at 1e-4 km/s the column is ~1e3 km of signal on
+        // ~1e3 km of noise and Newton stalls around a 1000 km miss. 1e-3 km/s
+        // moves arrival by ~1e4 km, an order of magnitude above the floor,
+        // while staying well inside the linear regime.
+        const H: f64 = 1e-3;
         let mut jac = [[0.0f64; 3]; 3];
         for c in 0..3 {
             let mut vp = vinf;
             vp[c] += H;
-            let fp = shoot(vp);
+            let Some(fp) = shoot(vp) else {
+                return (best_vinf, best_norm);
+            };
             for r in 0..3 {
                 jac[r][c] = (fp[r] - f[r]) / H;
             }
@@ -1562,13 +1617,36 @@ pub fn differential_correct(
         let dv = [solve_col(0), solve_col(1), solve_col(2)];
         // Damp absurd steps (near-singular geometry).
         let dvn = norm(dv);
-        let scale = if dvn > 1.0 { 1.0 / dvn } else { 1.0 };
-        for c in 0..3 {
-            vinf[c] += dv[c] * scale;
+        let mut scale = if dvn > 1.0 { 1.0 / dvn } else { 1.0 };
+        // Backtracking line search: the full Newton step overshoots once the
+        // residual approaches the noise floor, which is what sent the old
+        // fixed-step loop wandering back up into the 1e4 km range. Halve until
+        // the step actually improves, then accept it.
+        let mut stepped = false;
+        for _ in 0..6 {
+            let mut trial = vinf;
+            for c in 0..3 {
+                trial[c] += dv[c] * scale;
+            }
+            if let Some(ft) = shoot(trial) {
+                if norm(ft) < norm(f) {
+                    vinf = trial;
+                    f = ft;
+                    stepped = true;
+                    break;
+                }
+            }
+            scale *= 0.5;
         }
-        f = shoot(vinf);
+        if !stepped {
+            break; // no improving step along this direction; best_* already holds the answer
+        }
+        if norm(f) < best_norm {
+            best_norm = norm(f);
+            best_vinf = vinf;
+        }
     }
-    (vinf, norm(f))
+    (best_vinf, best_norm)
 }
 
 /// A tour refined to mission grade: every leg is a continuous full-fidelity
