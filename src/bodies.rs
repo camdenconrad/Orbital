@@ -63,6 +63,13 @@ pub const ALL_BODIES: [BodyId; 21] = [
 ];
 
 impl BodyId {
+    /// Index into [`ALL_BODIES`]. `BodyId` is fieldless and declared in the
+    /// same order as the array, so the discriminant *is* the index — no scan.
+    #[inline]
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             BodyId::Sun => "Sun",
@@ -251,6 +258,19 @@ impl BodyId {
             BodyId::Vesta => 2_000_004,
             BodyId::Pallas => 2_000_002,
             BodyId::Hygiea => 2_000_010,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `index()` relies on `BodyId`'s declaration order matching `ALL_BODIES`.
+    #[test]
+    fn index_matches_all_bodies_order() {
+        for (i, b) in ALL_BODIES.iter().enumerate() {
+            assert_eq!(b.index(), i, "{} out of order", b.name());
         }
     }
 }
