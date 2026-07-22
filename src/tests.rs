@@ -615,13 +615,71 @@ fn gpu_porkchop_computes() {
         },
     )
     .expect("gpu compute failed");
-    let valid = pc.grid.iter().filter(|c| c[0] < 1e6).count();
+    let valid = pc.grid.iter().filter(|c| crate::porkchop::Porkchop::is_valid(**c)).count();
     println!("porkchop: {}/{} cells solved", valid, pc.grid.len());
     assert!(valid > pc.grid.len() / 4, "too few Lambert solutions: {valid}");
     // Spot-check one good cell against the CPU f64 Lambert.
     let (i, j) = (crate::porkchop::NX / 2, crate::porkchop::NY / 2);
     let [vd, _] = pc.cell(i, j);
     assert!(vd > 0.1 && vd < 50.0, "midgrid v∞ dep {vd}");
+
+    // Every cell the shader claims to have solved must be a cell the f64 CPU
+    // solver also solves, to the same conic (issue #2: the shader used to omit
+    // the TOF bracket test and fabricate solutions over whole regions).
+    let mut checked = 0;
+    let mut agree = 0;
+    let mut fabricated = Vec::new();
+    // Deterministic sample of the grid: a stride coprime with the cell count.
+    let n = pc.grid.len();
+    for k in 0..600 {
+        let idx = (k * 2411) % n;
+        let (i, j) = (idx % crate::porkchop::NX, idx / crate::porkchop::NX);
+        let cell = pc.cell(i, j);
+        if !crate::porkchop::Porkchop::is_valid(cell) {
+            continue;
+        }
+        checked += 1;
+        let (r1, r2, tof_s) = pc.cell_lambert_inputs(&eph, BodyId::Mars, i, j);
+        let mu = BodyId::Sun.gm();
+        match crate::solver::lambert_rev(r1, r2, tof_s, mu, 0, false) {
+            None => fabricated.push((i, j, cell[0])),
+            Some((v1, _)) => {
+                // Compare speeds only: v∞ folds in Earth's velocity, so match
+                // the departure speed of the conic itself (f32 shader vs f64).
+                let cpu = (v1[0].powi(2) + v1[1].powi(2) + v1[2].powi(2)).sqrt();
+                let e = eph.state(
+                    BodyId::Earth,
+                    pc.start + Duration::from_days(pc.cell_time(i, j).0),
+                );
+                let gpu_v1 = [
+                    v1[0] - e.vel_km_s[0],
+                    v1[1] - e.vel_km_s[1],
+                    v1[2] - e.vel_km_s[2],
+                ];
+                let cpu_vinf =
+                    (gpu_v1[0].powi(2) + gpu_v1[1].powi(2) + gpu_v1[2].powi(2)).sqrt();
+                assert!(cpu > 0.0);
+                // f32 bisection on a 1e8-km-scale problem: ~1e-3 relative.
+                let tol = 0.02 * cpu_vinf.max(1.0);
+                assert!(
+                    (cpu_vinf - cell[0] as f64).abs() < tol,
+                    "cell ({i},{j}): GPU v∞ {} vs CPU {cpu_vinf}",
+                    cell[0]
+                );
+                agree += 1;
+            }
+        }
+    }
+    println!("cross-checked {checked} valid cells, {agree} agree");
+    assert!(checked > 50, "sample found too few valid cells: {checked}");
+    // A handful of cells may straddle the bracket edge where f32 and f64
+    // disagree on reachability; wholesale fabrication must be gone.
+    assert!(
+        fabricated.len() * 100 <= checked,
+        "{} of {checked} GPU cells have no CPU solution: {:?}",
+        fabricated.len(),
+        &fabricated[..fabricated.len().min(8)]
+    );
 }
 
 /// Low-thrust physics: a year of full along-track NEXT-C thrust must raise

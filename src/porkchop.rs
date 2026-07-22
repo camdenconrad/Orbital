@@ -53,13 +53,59 @@ pub struct Porkchop {
     pub window_days: f64,
     pub tof_min_days: f64,
     pub tof_max_days: f64,
-    /// Row-major [j * NX + i]: (v∞ dep, v∞ arr); ≥ 1e8 marks no solution.
+    /// Row-major [j * NX + i]: (v∞ dep, v∞ arr); `INVALID` marks no solution.
     pub grid: Vec<[f32; 2]>,
 }
+
+/// Sentinel the shader writes for a cell whose Lambert problem has no
+/// single-rev solution. Must match `INVALID` in the WGSL source.
+pub const INVALID: f32 = 1e30;
+
+/// Spacing of the pre-sampled target-state span, days. The shader
+/// interpolates linearly between these samples.
+const SPAN_DT_DAYS: f64 = 0.5;
 
 impl Porkchop {
     pub fn cell(&self, i: usize, j: usize) -> [f32; 2] {
         self.grid[j * NX + i]
+    }
+
+    /// Did the shader find a transfer for this cell?
+    pub fn is_valid(cell: [f32; 2]) -> bool {
+        cell[0] < INVALID && cell[1] < INVALID
+    }
+
+    /// The exact Lambert inputs the shader saw for a cell: departure position,
+    /// arrival position (linearly interpolated on the sampled span, as
+    /// in-shader) and TOF in seconds. Lets the CPU solver be run on the same
+    /// problem the GPU solved.
+    pub fn cell_lambert_inputs(
+        &self,
+        eph: &Ephemeris,
+        target: BodyId,
+        i: usize,
+        j: usize,
+    ) -> ([f64; 3], [f64; 3], f64) {
+        let (dep_days, tof_days) = self.cell_time(i, j);
+        let r1 = eph.state(BodyId::Earth, self.start + Duration::from_days(dep_days)).pos_km;
+        let n_span = self.n_span();
+        let x = ((dep_days + tof_days) / SPAN_DT_DAYS).clamp(0.0, (n_span - 2) as f64);
+        let i0 = x.floor() as usize;
+        let fr = x - x.floor();
+        let sample = |k: usize| {
+            eph.state(target, self.start + Duration::from_days(k as f64 * SPAN_DT_DAYS)).pos_km
+        };
+        let (p0, p1) = (sample(i0), sample(i0 + 1));
+        let r2 = [
+            p0[0] + (p1[0] - p0[0]) * fr,
+            p0[1] + (p1[1] - p0[1]) * fr,
+            p0[2] + (p1[2] - p0[2]) * fr,
+        ];
+        (r1, r2, tof_days * DAY_S)
+    }
+
+    fn n_span(&self) -> usize {
+        ((self.window_days + self.tof_max_days + 2.0) / SPAN_DT_DAYS).ceil() as usize + 2
     }
 
     /// (depart_days offset, tof_days) for a cell.
@@ -95,41 +141,57 @@ fn stumpff_s(z: f32) -> f32 {
     return 1.0 / 6.0;
 }
 
+// Sentinel written into a cell the solver rejects; the host treats any
+// component >= INVALID as "no solution" (see Porkchop::is_valid).
+const INVALID: f32 = 1e30;
+// TOF of the y<0 side: sorts below every reachable target, so the bracket
+// test and the bisection branch both read it as "too early".
+const TOF_NONE: f32 = -1e30;
+
+fn lam_y(r1n: f32, r2n: f32, a_coef: f32, z: f32) -> f32 {
+    return r1n + r2n + a_coef * (z * stumpff_s(z) - 1.0) / sqrt(stumpff_c(z));
+}
+fn lam_tof(r1n: f32, r2n: f32, a_coef: f32, z: f32) -> f32 {
+    let yv = lam_y(r1n, r2n, a_coef, z);
+    if yv < 0.0 { return TOF_NONE; } // below the parabolic boundary
+    return pow(yv / stumpff_c(z), 1.5) * stumpff_s(z) + a_coef * sqrt(yv);
+}
+
 // Single-rev prograde Lambert, bisection on z (mirrors the CPU f64 version).
 fn lambert(r1: vec3<f32>, r2: vec3<f32>, tof: f32, mu: f32) -> mat2x3<f32> {
-    let fail = mat2x3<f32>(vec3(1e12), vec3(1e12));
+    let fail = mat2x3<f32>(vec3(INVALID), vec3(INVALID));
     let r1n = length(r1);
     let r2n = length(r2);
+    if r1n < 1.0 || r2n < 1.0 || tof <= 0.0 { return fail; }
     let cosd = clamp(dot(r1, r2) / (r1n * r2n), -1.0, 1.0);
     var dtheta = acos(cosd);
     if r1.x * r2.y - r1.y * r2.x < 0.0 { dtheta = 6.2831853 - dtheta; }
     let a_coef = sin(dtheta) * sqrt(r1n * r2n / (1.0 - cosd));
-    if abs(a_coef) < 1.0 { return fail; }
+    if !(abs(a_coef) >= 1e-8) { return fail; } // colinear geometry (or NaN)
 
     let tgt = sqrt(mu) * tof;
-    var z_lo = -157.9; // -16π²
-    var z_hi = 39.47;  // (2π)² - ε
+    var z_lo = -157.91367; // -16π²
+    var z_hi = 39.478417;  // (2π)² - ε
     // Walk z_lo up to the y>0 validity boundary.
-    var y_lo = r1n + r2n + a_coef * (z_lo * stumpff_s(z_lo) - 1.0) / sqrt(stumpff_c(z_lo));
-    if y_lo < 0.0 {
+    if lam_tof(r1n, r2n, a_coef, z_lo) == TOF_NONE {
         var bad = z_lo;
         var good = z_hi;
-        for (var k = 0; k < 40; k++) {
+        for (var k = 0; k < 60; k++) {
             let mid = 0.5 * (bad + good);
-            let ym = r1n + r2n + a_coef * (mid * stumpff_s(mid) - 1.0) / sqrt(stumpff_c(mid));
-            if ym > 0.0 { good = mid; } else { bad = mid; }
+            if lam_tof(r1n, r2n, a_coef, mid) != TOF_NONE { good = mid; } else { bad = mid; }
         }
         z_lo = good;
+    }
+    // The CPU solver's bracket test: outside [tof(z_lo), tof(z_hi)] the
+    // requested TOF is unreachable single-rev and bisection would otherwise
+    // fabricate a conic at whichever endpoint it converges to.
+    if !(lam_tof(r1n, r2n, a_coef, z_lo) <= tgt && tgt <= lam_tof(r1n, r2n, a_coef, z_hi)) {
+        return fail;
     }
     var z = 0.0;
     for (var k = 0; k < 60; k++) {
         z = 0.5 * (z_lo + z_hi);
-        let c = stumpff_c(z);
-        let s = stumpff_s(z);
-        let yv = r1n + r2n + a_coef * (z * s - 1.0) / sqrt(c);
-        var t: f32;
-        if yv < 0.0 { t = -1e30; } else { t = pow(yv / c, 1.5) * s + a_coef * sqrt(yv); }
-        if t < tgt { z_lo = z; } else { z_hi = z; }
+        if lam_tof(r1n, r2n, a_coef, z) < tgt { z_lo = z; } else { z_hi = z; }
     }
     let c = stumpff_c(z);
     let s = stumpff_s(z);
@@ -161,6 +223,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tv = mix(t0.vel.xyz, t1.vel.xyz, fr);
 
     let vs = lambert(e.pos.xyz, tp, tof, p.mu);
+    if vs[0].x >= INVALID {
+        results[gid.y * p.nx + gid.x] = vec2(INVALID, INVALID);
+        return;
+    }
     let vinf_dep = length(vs[0] - e.vel.xyz);
     let vinf_arr = length(vs[1] - tv);
     results[gid.y * p.nx + gid.x] = vec2(vinf_dep, vinf_arr);
@@ -204,9 +270,8 @@ pub fn compute(
             ],
         });
     }
-    let span_days = window_days + tof_max_days + 2.0;
-    let span_dt_days = 0.5;
-    let n_span = (span_days / span_dt_days).ceil() as usize + 2;
+    let span_dt_days = SPAN_DT_DAYS;
+    let n_span = ((window_days + tof_max_days + 2.0) / span_dt_days).ceil() as usize + 2;
     let mut target_states = Vec::with_capacity(n_span);
     for k in 0..n_span {
         let e = start + Duration::from_days(k as f64 * span_dt_days);
