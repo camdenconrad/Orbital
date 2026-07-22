@@ -673,7 +673,7 @@ fn soi_km(eph: &Ephemeris, body: BodyId, epoch: Epoch) -> f64 {
     r * (body.gm() / BodyId::Sun.gm()).powf(0.4)
 }
 
-fn evaluate(
+pub fn evaluate(
     eph: &Ephemeris,
     dyn_cfg: &DynamicsConfig,
     cfg: &SolverConfig,
@@ -688,6 +688,57 @@ fn evaluate(
         evaluate_lowthrust(eph, dyn_cfg, cfg, epoch0, g, n_samples)
     } else {
         evaluate_direct(eph, dyn_cfg, cfg, epoch0, g, n_samples)
+    }
+}
+
+/// Shared mission scoring: the objective plus the hardware-feasibility terms
+/// every evaluator must charge. Currently that is the launcher C3 cap —
+/// `vinf_dep² > C3_max` means the trajectory cannot be flown by the selected
+/// launch vehicle at all, so it is charged far above any miss penalty and can
+/// never outrank a feasible candidate. `extra` carries evaluator-specific
+/// terms (miss, propellant, flyby Δv) already summed by the caller.
+fn mission_score(
+    cfg: &SolverConfig,
+    vinf_dep: f64,
+    arrival_dv: f64,
+    tof_days: f64,
+    extra: f64,
+) -> f64 {
+    let c3_over = (vinf_dep * vinf_dep - cfg.launcher.c3_max()).max(0.0);
+    cfg.objective.score(vinf_dep, arrival_dv, tof_days) + extra + c3_over * 5.0
+}
+
+/// Score for a candidate whose propagation ran out of integrator steps. The
+/// flight never reached its arrival epoch, so nothing about its "arrival" is
+/// meaningful: it is infeasible, ranked below every complete candidate and
+/// graded by how far short it fell so the search still sees a gradient.
+fn truncated_score(fraction: f64) -> f64 {
+    1e6 + (1.0 - fraction.clamp(0.0, 1.0)) * 1e6
+}
+
+/// Solution for a truncated (step-exhausted) propagation: infeasible, with no
+/// arrival claim. `arrive` is the epoch actually reached, not the requested one.
+fn infeasible(
+    g: &Genome,
+    fraction: f64,
+    vinf_dep: f64,
+    depart: Epoch,
+    arrive: Epoch,
+    traj: Vec<(Epoch, ScState)>,
+) -> Solution {
+    Solution {
+        genome: g.clone(),
+        score: truncated_score(fraction),
+        vinf_dep_kms: vinf_dep,
+        vinf_arr_kms: f64::INFINITY,
+        arrival_dv_kms: f64::INFINITY,
+        thrust_dv_kms: 0.0,
+        assist_dv_kms: 0.0,
+        flybys: Vec::new(),
+        miss_km: f64::INFINITY,
+        depart,
+        arrive,
+        traj,
     }
 }
 
@@ -737,7 +788,7 @@ fn evaluate_lowthrust(
         accel_kms2: cfg.engine.accel_kms2(),
         total_s,
     };
-    let traj = dynamics::propagate_thrusted(
+    let prop = dynamics::propagate_checked(
         eph,
         dyn_cfg,
         depart,
@@ -746,7 +797,11 @@ fn evaluate_lowthrust(
         n_samples,
         Some(&thrust),
     );
+    let traj = prop.points;
     let (arrive, sf) = *traj.last().unwrap();
+    if !prop.complete {
+        return infeasible(g, prop.fraction, vmag, depart, arrive, traj);
+    }
     let tgt = eph.state(cfg.target, arrive);
     let dr = [
         sf.pos[0] - tgt.pos_km[0],
@@ -776,17 +831,21 @@ fn evaluate_lowthrust(
     let arrival_dv = arrival_dv_kms(cfg.target, v_rel, cfg.mission);
     let excess_miss = (miss_km - soi_km(eph, cfg.target, arrive)).max(0.0);
     // Launcher C3 cap and propellant budget, charged steeply past the limit.
-    let c3_over = (vinf_dep * vinf_dep - cfg.launcher.c3_max()).max(0.0);
     let prop_over = (thrust_dv - cfg.engine.max_dv_kms()).max(0.0);
-    // Hardware violations are charged far above any miss penalty: a candidate
-    // that "arrives" on a launcher or tank that doesn't exist must never
-    // outrank a feasible candidate that still has distance to close.
-    let score = cfg.objective.score(vinf_dep, arrival_dv, g.legs[0])
-        + thrust_dv * 0.25 // propellant is cheaper than launch/capture Δv
-        + excess_miss * 1e-6
-        + miss_km * 3e-8
-        + c3_over * 5.0
-        + prop_over * 50.0;
+    // Hardware violations are charged far above any miss penalty (the launcher
+    // C3 term lives in `mission_score`): a candidate that "arrives" on a
+    // launcher or tank that doesn't exist must never outrank a feasible
+    // candidate that still has distance to close.
+    let score = mission_score(
+        cfg,
+        vinf_dep,
+        arrival_dv,
+        g.legs[0],
+        thrust_dv * 0.25 // propellant is cheaper than launch/capture Δv
+            + excess_miss * 1e-6
+            + miss_km * 3e-8
+            + prop_over * 50.0,
+    );
 
     Solution {
         genome: g.clone(),
@@ -937,7 +996,7 @@ fn evaluate_tour(
 
     let total_tof = g.total_tof_days();
     let arrival_dv = arrival_dv_kms(cfg.target, vinf_arr, cfg.mission);
-    let score = cfg.objective.score(vinf_dep, arrival_dv, total_tof) + assist_dv;
+    let score = mission_score(cfg, vinf_dep, arrival_dv, total_tof, assist_dv);
 
     // Sample each Lambert conic for rendering.
     let per_leg = (n_samples / g.legs.len().max(1)).max(8);
@@ -1017,15 +1076,20 @@ fn evaluate_direct(
             earth.vel_km_s[2] + g.vinf_dep[2],
         ],
     };
-    let traj = dynamics::propagate(
+    let prop = dynamics::propagate_checked(
         eph,
         dyn_cfg,
         depart,
         s0,
         Duration::from_seconds(g.legs[0] * DAY_S),
         n_samples,
+        None,
     );
+    let traj = prop.points;
     let (arrive, sf) = *traj.last().unwrap();
+    if !prop.complete {
+        return infeasible(g, prop.fraction, vmag, depart, arrive, traj);
+    }
     let tgt = eph.state(cfg.target, arrive);
     let dr = [
         sf.pos[0] - tgt.pos_km[0],
@@ -1049,9 +1113,13 @@ fn evaluate_direct(
     // at the SOI boundary.
     let excess = (miss_km - soi_km(eph, cfg.target, arrive)).max(0.0);
     let arrival_dv = arrival_dv_kms(cfg.target, vinf_arr, cfg.mission);
-    let score = cfg.objective.score(vinf_dep, arrival_dv, g.legs[0])
-        + excess * 1e-6
-        + miss_km * 3e-8;
+    let score = mission_score(
+        cfg,
+        vinf_dep,
+        arrival_dv,
+        g.legs[0],
+        excess * 1e-6 + miss_km * 3e-8,
+    );
 
     Solution {
         genome: g.clone(),
@@ -1438,8 +1506,12 @@ pub fn differential_correct(
             vinf_dep: vinf,
             thrust: Vec::new(),
         };
+        // Correct against the *requested* target: `evaluate_direct` computes
+        // its SOI and arrival Δv from `cfg.target`, so defaulting it here
+        // would shoot at Mars no matter which body was asked for.
         let cfg = SolverConfig {
             route: Vec::new(),
+            target,
             ..Default::default()
         };
         let sol = evaluate_direct(eph, dyn_cfg, &cfg, depart, &g, 2);
@@ -1585,21 +1657,29 @@ pub fn refine_tour(
         let tof = epochs[i + 1] - epochs[i];
         let target_pos = states[i + 1].pos_km;
 
-        let shoot = |v: [f64; 3]| -> [f64; 3] {
-            let leg = dynamics::propagate(
+        // `None` marks a leg the integrator could not fly to its end epoch:
+        // its partial endpoint says nothing about where the leg arrives.
+        let shoot = |v: [f64; 3]| -> Option<[f64; 3]> {
+            let leg = dynamics::propagate_checked(
                 eph,
                 &leg_dyn,
                 epochs[i],
                 ScState { pos: start_pos, vel: v },
                 tof,
                 2,
+                None,
             );
-            let sf = leg.last().unwrap().1;
-            sub(sf.pos, target_pos)
+            if !leg.complete {
+                return None;
+            }
+            let sf = leg.points.last().unwrap().1;
+            Some(sub(sf.pos, target_pos))
         };
 
         let mut v = legs_v[i];
-        let mut f = shoot(v);
+        let Some(mut f) = shoot(v) else {
+            return None;
+        };
         for _ in 0..5 {
             if norm(f) < 300.0 {
                 break;
@@ -1609,7 +1689,9 @@ pub fn refine_tour(
             for c in 0..3 {
                 let mut vp = v;
                 vp[c] += H;
-                let fp = shoot(vp);
+                let Some(fp) = shoot(vp) else {
+                    return None;
+                };
                 for r in 0..3 {
                     jac[r][c] = (fp[r] - f[r]) / H;
                 }
@@ -1637,22 +1719,29 @@ pub fn refine_tour(
             for c in 0..3 {
                 v[c] += dv[c] * scale;
             }
-            f = shoot(v);
+            let Some(fnew) = shoot(v) else {
+                return None;
+            };
+            f = fnew;
         }
         worst_miss = worst_miss.max(norm(f));
 
         // Dense pass for rendering + the arrival velocity.
-        let dense = dynamics::propagate(
+        let dense = dynamics::propagate_checked(
             eph,
             &leg_dyn,
             epochs[i],
             ScState { pos: start_pos, vel: v },
             tof,
             240,
+            None,
         );
+        if !dense.complete {
+            return None;
+        }
         start_vels.push(v);
-        end_vels.push(dense.last().unwrap().1.vel);
-        traj.extend_from_slice(&dense);
+        end_vels.push(dense.points.last().unwrap().1.vel);
+        traj.extend_from_slice(&dense.points);
     }
     // Real flyby parameters from corrected velocities.
     let mut flybys = Vec::new();

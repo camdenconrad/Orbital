@@ -696,3 +696,215 @@ fn sep_pluto_search_uses_thrust() {
     );
     assert!(sol.thrust_dv_kms < cfg.engine.max_dv_kms() * 1.5);
 }
+
+/// Issue #1: the launcher C3 cap must bind on *every* evaluator, not just the
+/// low-thrust one. A direct transfer needing C3 ≈ 200 km²/s² has to score far
+/// worse on a Falcon Heavy (C3 ≤ 60) than on a kick stage (C3 ≤ 130).
+#[test]
+fn launcher_c3_cap_binds_on_direct_transfers() {
+    use crate::solver::{evaluate_saved, Genome, Launcher, SolverConfig};
+    let eph = Ephemeris::Kepler;
+    let depart = j2000() + Duration::from_days(9000.0);
+    // |v∞| = sqrt(200) km/s along Earth's velocity: C3 = 200, over every cap.
+    let v = (200.0f64 / 3.0).sqrt();
+    let g = Genome {
+        depart_days: 0.0,
+        legs: vec![250.0],
+        vinf_dep: [v, v, v],
+        thrust: Vec::new(),
+    };
+    let score_for = |l: Launcher| {
+        let cfg = SolverConfig {
+            launcher: l,
+            ..Default::default()
+        };
+        evaluate_saved(&eph, &cfg, depart, &g).score
+    };
+    let fh = score_for(Launcher::FalconHeavy);
+    let kick = score_for(Launcher::KickStage);
+    // Penalty difference is exactly (130 − 60) · 5 = 350.
+    assert!(
+        (fh - kick - 350.0).abs() < 1e-6,
+        "direct C3 penalty not applied: FH {fh}, kick {kick}"
+    );
+    // And the over-cap solution must lose outright to a plausible in-cap one.
+    let cheap = Genome {
+        vinf_dep: [2.0, 2.0, 1.0],
+        ..g.clone()
+    };
+    let cfg = SolverConfig {
+        launcher: Launcher::FalconHeavy,
+        ..Default::default()
+    };
+    assert!(
+        evaluate_saved(&eph, &cfg, depart, &cheap).score
+            < evaluate_saved(&eph, &cfg, depart, &g).score,
+        "over-cap candidate outranked an in-cap one"
+    );
+}
+
+/// Issue #1, tour branch: the same cap must bind on `evaluate_tour`.
+#[test]
+fn launcher_c3_cap_binds_on_tours() {
+    use crate::solver::{evaluate_saved, Genome, Launcher, SolverConfig};
+    let eph = Ephemeris::Kepler;
+    let epoch0 = j2000() + Duration::from_days(9000.0);
+    let base = |l: Launcher| SolverConfig {
+        launcher: l,
+        target: BodyId::Mars,
+        route: vec![BodyId::Venus],
+        ..Default::default()
+    };
+    // Scan a grid for a tour whose departure C3 lands between the two caps,
+    // where only the tighter launcher is violated.
+    let mut found = false;
+    for d in 0..40 {
+        for leg in [150.0f64, 200.0, 260.0, 320.0] {
+            let g = Genome {
+                depart_days: d as f64 * 10.0,
+                legs: vec![leg, leg * 1.2],
+                vinf_dep: [0.0; 3],
+                thrust: Vec::new(),
+            };
+            let fh = evaluate_saved(&eph, &base(Launcher::FalconHeavy), epoch0, &g);
+            let kick = evaluate_saved(&eph, &base(Launcher::KickStage), epoch0, &g);
+            let c3 = fh.vinf_dep_kms * fh.vinf_dep_kms;
+            if fh.score >= 1e4 || !(60.0..130.0).contains(&c3) {
+                continue;
+            }
+            found = true;
+            let expected = (c3 - 60.0) * 5.0;
+            assert!(
+                (fh.score - kick.score - expected).abs() < 1e-6,
+                "tour C3 penalty wrong: C3 {c3}, FH {}, kick {}",
+                fh.score,
+                kick.score
+            );
+        }
+    }
+    assert!(found, "no tour with C3 between the two launcher caps");
+}
+
+/// Issue #3: when the integrator runs out of steps, the propagation must say
+/// so rather than tagging its partial state with the full arrival epoch.
+#[test]
+fn step_exhaustion_is_reported() {
+    let eph = Ephemeris::Kepler;
+    let cfg = DynamicsConfig {
+        max_steps: 5,
+        ..Default::default()
+    };
+    let r0 = AU_KM;
+    let s0 = ScState {
+        pos: [r0, 0.0, 0.0],
+        vel: [0.0, dynamics::circular_speed_kms(r0), 0.0],
+    };
+    let span = Duration::from_days(4000.0);
+    let start = j2000();
+    let p = dynamics::propagate_checked(&eph, &cfg, start, s0, span, 50, None);
+    assert!(!p.complete, "5 steps cannot cover 4000 days");
+    assert!(p.fraction < 1.0, "fraction {} should be short", p.fraction);
+    let (last, _) = *p.points.last().unwrap();
+    assert!(
+        last < start + span,
+        "truncated arc still tagged with the full arrival epoch"
+    );
+
+    // A generous budget over the same span completes and lands on the epoch.
+    let ok = dynamics::propagate_checked(
+        &eph,
+        &DynamicsConfig::default(),
+        start,
+        s0,
+        span,
+        50,
+        None,
+    );
+    assert!(ok.complete);
+    assert!((ok.fraction - 1.0).abs() < 1e-12);
+    assert!((ok.points.last().unwrap().0 - (start + span)).to_seconds().abs() < 1e-3);
+}
+
+/// Issue #3, solver side: a truncated flight must be scored infeasible, never
+/// ranked as an arrival.
+#[test]
+fn truncated_flights_score_infeasible() {
+    use crate::solver::{evaluate, solver_dynamics, Genome, SolverConfig};
+    let eph = Ephemeris::Kepler;
+    let cfg = SolverConfig::default();
+    let depart = j2000() + Duration::from_days(9000.0);
+    let g = Genome {
+        depart_days: 0.0,
+        legs: vec![250.0],
+        vinf_dep: [1.0, 3.0, 0.2],
+        thrust: Vec::new(),
+    };
+    let full = solver_dynamics();
+    let good = evaluate(&eph, &full, &cfg, depart, &g, 32);
+    assert!(good.score < 1e6, "baseline should be feasible: {}", good.score);
+
+    let starved = DynamicsConfig {
+        max_steps: 5,
+        ..full
+    };
+    let bad = evaluate(&eph, &starved, &cfg, depart, &g, 32);
+    assert!(
+        bad.score >= 1e6 && bad.score > good.score,
+        "truncated flight scored {} (feasible baseline {})",
+        bad.score,
+        good.score
+    );
+    assert!(bad.miss_km.is_infinite(), "truncated flight claimed a miss distance");
+    assert!(
+        bad.arrive < depart + Duration::from_days(250.0),
+        "truncated flight claimed the full arrival epoch"
+    );
+}
+
+/// Issue #4: `differential_correct` must shoot at the body it was given, not
+/// at `SolverConfig::default()`'s Mars.
+#[test]
+fn differential_correct_honors_target() {
+    use crate::solver::{differential_correct, solver_dynamics};
+    let (eph, label) = Ephemeris::load();
+    if !label.starts_with("SPICE") {
+        eprintln!("kernels absent; skipping");
+        return;
+    }
+    let full = solver_dynamics();
+    let depart = j2000() + Duration::from_days(9000.0);
+    let tof = Duration::from_days(150.0);
+    let arrive = depart + tof;
+    // Aim roughly inward toward Venus and let the corrector close the miss.
+    let earth = eph.state(BodyId::Earth, depart);
+    let ev = earth.vel_km_s;
+    let en = (ev[0].powi(2) + ev[1].powi(2) + ev[2].powi(2)).sqrt();
+    let v0 = [-ev[0] / en * 3.0, -ev[1] / en * 3.0, -ev[2] / en * 3.0];
+    let (vinf, miss) =
+        differential_correct(&eph, &full, depart, tof, BodyId::Venus, v0);
+    assert!(miss < 5_000.0, "corrector left {miss:.0} km miss to Venus");
+
+    // Independent check: propagating the corrected v∞ must end near Venus,
+    // and nowhere near Mars — proving the target argument was honored.
+    const EARTH_SOI_KM: f64 = 925_000.0;
+    let vn = (vinf[0].powi(2) + vinf[1].powi(2) + vinf[2].powi(2)).sqrt();
+    let s0 = ScState {
+        pos: [
+            earth.pos_km[0] + vinf[0] / vn * EARTH_SOI_KM,
+            earth.pos_km[1] + vinf[1] / vn * EARTH_SOI_KM,
+            earth.pos_km[2] + vinf[2] / vn * EARTH_SOI_KM,
+        ],
+        vel: [ev[0] + vinf[0], ev[1] + vinf[1], ev[2] + vinf[2]],
+    };
+    let traj = dynamics::propagate(&eph, &full, depart, s0, tof, 8);
+    let sf = traj.last().unwrap().1;
+    let dist = |b: BodyId| {
+        let s = eph.state(b, arrive);
+        ((sf.pos[0] - s.pos_km[0]).powi(2)
+            + (sf.pos[1] - s.pos_km[1]).powi(2)
+            + (sf.pos[2] - s.pos_km[2]).powi(2))
+        .sqrt()
+    };
+    assert!(dist(BodyId::Venus) < 5_000.0, "not at Venus: {}", dist(BodyId::Venus));
+    assert!(dist(BodyId::Mars) > 1e7, "suspiciously close to Mars too");
+}

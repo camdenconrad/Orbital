@@ -197,7 +197,7 @@ pub fn propagate(
     span: Duration,
     n_samples: usize,
 ) -> Vec<(Epoch, ScState)> {
-    propagate_thrusted(eph, cfg, epoch0, state0, span, n_samples, None)
+    propagate_checked(eph, cfg, epoch0, state0, span, n_samples, None).points
 }
 
 /// As `propagate`, with an optional continuous low-thrust profile.
@@ -210,6 +210,37 @@ pub fn propagate_thrusted(
     n_samples: usize,
     thrust: Option<&Thrust>,
 ) -> Vec<(Epoch, ScState)> {
+    propagate_checked(eph, cfg, epoch0, state0, span, n_samples, thrust).points
+}
+
+/// Result of a propagation, including whether the integrator actually reached
+/// the requested end epoch.
+///
+/// The step budget (`DynamicsConfig::max_steps`) can run out mid-flight. The
+/// final sample is then only a partial arc: it must NOT be read as an arrival
+/// state, because it carries an epoch earlier than the requested one and a
+/// position nowhere near where the trajectory would have ended.
+pub struct Propagation {
+    /// Sampled (epoch, state) points. The last point is tagged with the epoch
+    /// actually reached, which is `epoch0 + span` only when `complete`.
+    pub points: Vec<(Epoch, ScState)>,
+    /// False if the step budget was exhausted before reaching `epoch0 + span`.
+    pub complete: bool,
+    /// Fraction of the requested span actually propagated, in [0, 1].
+    pub fraction: f64,
+}
+
+/// As `propagate_thrusted`, but reports step exhaustion instead of silently
+/// tagging a truncated arc with the full arrival epoch.
+pub fn propagate_checked(
+    eph: &Ephemeris,
+    cfg: &DynamicsConfig,
+    epoch0: Epoch,
+    state0: ScState,
+    span: Duration,
+    n_samples: usize,
+    thrust: Option<&Thrust>,
+) -> Propagation {
     let total = span.to_seconds();
     let dir = total.signum();
     let total = total.abs();
@@ -306,8 +337,15 @@ pub fn propagate_thrusted(
         };
         h = (h * factor).clamp(1.0, 30.0 * 86_400.0);
     }
-    push(&mut out, total, &y);
-    out
+    // `t` is the time actually integrated: equal to `total` on success, less
+    // when the step budget ran out. Tag the final sample with the truth.
+    push(&mut out, t.min(total), &y);
+    let complete = t >= total;
+    Propagation {
+        points: out,
+        complete,
+        fraction: if total > 0.0 { (t / total).clamp(0.0, 1.0) } else { 1.0 },
+    }
 }
 
 /// Circular-orbit speed about the Sun at radius r (km) — handy for demo states.
