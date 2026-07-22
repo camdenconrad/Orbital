@@ -689,7 +689,7 @@ impl App {
         let mut scores = vec![f32::INFINITY; pc.grid.len()];
         let mut lo = f32::INFINITY;
         for (k, cell) in pc.grid.iter().enumerate() {
-            if cell[0] < 1e6 {
+            if porkchop::Porkchop::is_valid(*cell) {
                 let arr = solver::arrival_dv_kms(
                     self.solver_cfg.target,
                     cell[1] as f64,
@@ -1412,7 +1412,7 @@ impl App {
                 let [vd, va] = pc.cell(i, j);
                 let (dep_d, tof_d) = pc.cell_time(i, j);
                 let (y, m, d, ..) = (pc.start + Duration::from_days(dep_d)).to_gregorian_utc();
-                if vd < 1e6 {
+                if porkchop::Porkchop::is_valid([vd, va]) {
                     let arr_dv = solver::arrival_dv_kms(
                         self.solver_cfg.target,
                         va as f64,
@@ -1427,7 +1427,7 @@ score {:.2}",
                 } else {
                     resp.clone().on_hover_text("no single-rev solution");
                 }
-                if resp.clicked() && vd < 1e6 {
+                if resp.clicked() && porkchop::Porkchop::is_valid([vd, va]) {
                     // CPU f64 refinement around the picked cell — the GPU only
                     // proposed; determinism lives on this side.
                     let mut cfg = self.solver_cfg.clone();
