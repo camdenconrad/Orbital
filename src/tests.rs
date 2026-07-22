@@ -1175,3 +1175,67 @@ fn differential_correct_honors_target() {
     assert!(dist(BodyId::Venus) < 5_000.0, "not at Venus: {}", dist(BodyId::Venus));
     assert!(dist(BodyId::Mars) > 1e7, "suspiciously close to Mars too");
 }
+
+/// Issue #9: the mission file must survive a write/read round trip, keys and
+/// all, with an explicit version stamp.
+#[test]
+fn mission_file_round_trips() {
+    use crate::mission;
+    use crate::solver::{evaluate_saved, Engine, Genome, Launcher, MissionType, SolverConfig};
+    let eph = Ephemeris::Kepler;
+    let epoch0 = j2000() + Duration::from_days(9000.0);
+    let cfg = SolverConfig {
+        target: BodyId::Mars,
+        route: vec![BodyId::Venus],
+        mission: MissionType::Orbit,
+        engine: Engine::NextC,
+        launcher: Launcher::Sls,
+        auto_route: false,
+        ..Default::default()
+    };
+    let g = Genome {
+        depart_days: 30.0,
+        legs: vec![180.0, 220.0],
+        vinf_dep: [0.1, -0.2, 0.05],
+        thrust: vec![[0.3, 0.4, 0.5]],
+        dsm: vec![[0.5, 0.1, 0.2, 0.3]],
+    };
+    let sol = evaluate_saved(&eph, &cfg, epoch0, &g);
+    let text = mission::serialize(&sol, &cfg);
+    assert!(
+        text.starts_with(&format!("version={}\n", mission::FORMAT_VERSION)),
+        "missing version stamp: {text}"
+    );
+    let (cfg2, g2, depart) = mission::deserialize(&text).expect("round trip must parse");
+    assert_eq!(cfg2.target, cfg.target);
+    assert_eq!(cfg2.route, cfg.route);
+    assert!(cfg2.mission == cfg.mission);
+    assert!(cfg2.engine == cfg.engine);
+    assert!(cfg2.launcher == cfg.launcher);
+    assert_eq!(g2.legs, g.legs);
+    assert_eq!(g2.vinf_dep, g.vinf_dep);
+    assert_eq!(g2.thrust, g.thrust);
+    assert_eq!(g2.dsm, g.dsm);
+    assert!((depart.to_tdb_seconds() - sol.depart.to_tdb_seconds()).abs() < 1e-3);
+}
+
+/// Issue #9: a v1 file — no `version=` line, mission written as the UI
+/// `label()` string — must still load. This is the regression the version
+/// field exists to prevent: renaming a label may not orphan saved missions.
+#[test]
+fn mission_file_loads_legacy_label_keys() {
+    use crate::mission;
+    use crate::solver::{Engine, Launcher, MissionType};
+    let legacy = format!(
+        "target=Mars\nmission={}\nengine=next\nlauncher=sls\nroute=Venus\n\
+         depart_tdb_s=1e8\nlegs=1.8e2,2.2e2\nvinf=1e-1,-2e-1,5e-2\n\
+         thrust=3e-1:4e-1:5e-1\ndsm=5e-1:1e-1:2e-1:3e-1\n",
+        MissionType::Orbit.label()
+    );
+    let (cfg, g, _) = mission::deserialize(&legacy).expect("v1 file must still load");
+    assert!(cfg.mission == MissionType::Orbit);
+    assert!(cfg.engine == Engine::NextC);
+    assert!(cfg.launcher == Launcher::Sls);
+    assert_eq!(cfg.route, vec![BodyId::Venus]);
+    assert_eq!(g.legs, vec![180.0, 220.0]);
+}
