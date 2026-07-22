@@ -1,0 +1,698 @@
+//! Physics validation. Run with `cargo test --release` (the perihelion test
+//! integrates a century of Mercury's orbit).
+
+use crate::bodies::{BodyId, ALL_BODIES, AU_KM};
+use crate::dynamics::{self, DynamicsConfig, ScState};
+use crate::ephemeris::Ephemeris;
+use hifitime::{Duration, Epoch};
+
+fn j2000() -> Epoch {
+    Epoch::from_gregorian_utc_at_midnight(2000, 1, 1)
+}
+
+#[test]
+fn earth_is_about_one_au_out() {
+    let eph = Ephemeris::Kepler;
+    for days in [0.0, 100.0, 5000.0, -5000.0] {
+        let s = eph.state(BodyId::Earth, j2000() + Duration::from_days(days));
+        let r = (s.pos_km[0].powi(2) + s.pos_km[1].powi(2) + s.pos_km[2].powi(2)).sqrt() / AU_KM;
+        assert!((0.97..1.03).contains(&r), "r = {r} AU at {days} d");
+        let v = (s.vel_km_s[0].powi(2) + s.vel_km_s[1].powi(2) + s.vel_km_s[2].powi(2)).sqrt();
+        assert!((28.0..32.0).contains(&v), "v = {v} km/s at {days} d");
+    }
+}
+
+#[test]
+fn energy_conserved_over_a_decade() {
+    // Sun-only Newtonian two-body: specific orbital energy must hold.
+    let eph = Ephemeris::Kepler;
+    let mut cfg = DynamicsConfig {
+        relativity: false,
+        ..Default::default()
+    };
+    cfg.perturbers = [false; ALL_BODIES.len()];
+    cfg.perturbers[0] = true; // Sun only
+    let mu = BodyId::Sun.gm();
+    let r0 = 1.2 * AU_KM;
+    let v0 = dynamics::circular_speed_kms(r0) * 1.1;
+    let s0 = ScState {
+        pos: [r0, 0.0, 0.0],
+        vel: [0.0, v0, 0.0],
+    };
+    let energy = |s: &ScState| {
+        let r = (s.pos[0].powi(2) + s.pos[1].powi(2) + s.pos[2].powi(2)).sqrt();
+        let v2 = s.vel[0].powi(2) + s.vel[1].powi(2) + s.vel[2].powi(2);
+        v2 / 2.0 - mu / r
+    };
+    let traj = dynamics::propagate(&eph, &cfg, j2000(), s0, Duration::from_days(3650.0), 100);
+    let e0 = energy(&traj[0].1);
+    let e1 = energy(&traj.last().unwrap().1);
+    assert!(
+        ((e1 - e0) / e0).abs() < 1e-8,
+        "energy drift {:.3e}",
+        (e1 - e0) / e0
+    );
+}
+
+/// The signature GR test: a Mercury-like orbit must precess ~43″/century more
+/// with the 1PN term than without.
+#[test]
+fn mercury_perihelion_advance() {
+    let eph = Ephemeris::Kepler;
+    let mut cfg = DynamicsConfig::default();
+    cfg.perturbers = [false; ALL_BODIES.len()];
+    cfg.perturbers[0] = true; // Sun only: isolates the relativistic advance
+    cfg.rel_tol = 1e-12;
+
+    // Mercury-like: a = 0.387 AU, e = 0.2056, planar.
+    let mu = BodyId::Sun.gm();
+    let a = 0.387_098 * AU_KM;
+    let e = 0.205_63;
+    let rp = a * (1.0 - e);
+    let vp = (mu * (2.0 / rp - 1.0 / a)).sqrt();
+    let s0 = ScState {
+        pos: [rp, 0.0, 0.0],
+        vel: [0.0, vp, 0.0],
+    };
+
+    // Laplace–Runge–Lenz vector angle gives the apsidal orientation.
+    let lrl_angle = |s: &ScState| -> f64 {
+        let r = [s.pos[0], s.pos[1], s.pos[2]];
+        let v = [s.vel[0], s.vel[1], s.vel[2]];
+        let rn = (r[0].powi(2) + r[1].powi(2) + r[2].powi(2)).sqrt();
+        let h = [
+            r[1] * v[2] - r[2] * v[1],
+            r[2] * v[0] - r[0] * v[2],
+            r[0] * v[1] - r[1] * v[0],
+        ];
+        let vxh = [
+            v[1] * h[2] - v[2] * h[1],
+            v[2] * h[0] - v[0] * h[2],
+            v[0] * h[1] - v[1] * h[0],
+        ];
+        let ax = vxh[0] / mu - r[0] / rn;
+        let ay = vxh[1] / mu - r[1] / rn;
+        ay.atan2(ax)
+    };
+
+    let century = Duration::from_days(36_525.0);
+    cfg.relativity = true;
+    let with_gr = dynamics::propagate(&eph, &cfg, j2000(), s0, century, 10);
+    cfg.relativity = false;
+    let without = dynamics::propagate(&eph, &cfg, j2000(), s0, century, 10);
+
+    let adv_rad = lrl_angle(&with_gr.last().unwrap().1) - lrl_angle(&without.last().unwrap().1);
+    let adv_arcsec = adv_rad.to_degrees() * 3600.0;
+    assert!(
+        (adv_arcsec - 42.98).abs() < 2.0,
+        "perihelion advance = {adv_arcsec:.2}\"/century, expected ~43"
+    );
+}
+
+/// Requires data/de440s.bsp; checks the fallback tracks DE440 well.
+#[test]
+fn spice_and_kepler_agree() {
+    let (eph, label) = Ephemeris::load();
+    if !label.starts_with("DE440s") {
+        eprintln!("de440s.bsp not present; skipping");
+        return;
+    }
+    let kepler = Ephemeris::Kepler;
+    let epoch = j2000() + Duration::from_days(3652.5);
+    for body in [BodyId::Earth, BodyId::Mars, BodyId::Jupiter] {
+        let a = eph.state(body, epoch);
+        let b = kepler.state(body, epoch);
+        let d = ((a.pos_km[0] - b.pos_km[0]).powi(2)
+            + (a.pos_km[1] - b.pos_km[1]).powi(2)
+            + (a.pos_km[2] - b.pos_km[2]).powi(2))
+        .sqrt()
+            / AU_KM;
+        assert!(d < 0.1, "{}: DE440 vs Kepler differ by {d} AU", body.name());
+    }
+}
+
+/// The besom rule applied to the propagator: identical inputs must produce
+/// bit-identical trajectories, with whatever ephemeris is actually loaded.
+#[test]
+fn propagation_is_bit_reproducible() {
+    let (eph, _) = Ephemeris::load();
+    let cfg = DynamicsConfig::default();
+    let s0 = ScState {
+        pos: [1.1 * AU_KM, 0.0, 0.0],
+        vel: [0.0, 32.0, 3.0],
+    };
+    let run = || dynamics::propagate(&eph, &cfg, j2000(), s0, Duration::from_days(900.0), 500);
+    let (a, b) = (run(), run());
+    assert_eq!(a.len(), b.len());
+    for (pa, pb) in a.iter().zip(&b) {
+        assert_eq!(pa.0, pb.0);
+        assert_eq!(pa.1.pos.map(f64::to_bits), pb.1.pos.map(f64::to_bits));
+        assert_eq!(pa.1.vel.map(f64::to_bits), pb.1.vel.map(f64::to_bits));
+    }
+}
+
+/// Every cataloged body returns a sane state: moons sit near their parent,
+/// heliocentric bodies sit at plausible radii.
+#[test]
+fn all_bodies_have_sane_states() {
+    let (eph, _) = Ephemeris::load();
+    let epoch = j2000() + Duration::from_days(9000.0);
+    let rmag = |p: [f64; 3]| (p[0].powi(2) + p[1].powi(2) + p[2].powi(2)).sqrt();
+    for body in ALL_BODIES {
+        let s = eph.state(body, epoch);
+        if let Some(parent) = body.parent() {
+            let p = eph.state(parent, epoch);
+            let d = rmag([
+                s.pos_km[0] - p.pos_km[0],
+                s.pos_km[1] - p.pos_km[1],
+                s.pos_km[2] - p.pos_km[2],
+            ]);
+            assert!(
+                d > 1e4 && d < 3e6,
+                "{} is {d:.0} km from {}", body.name(), parent.name()
+            );
+        } else if body != BodyId::Sun {
+            let r = rmag(s.pos_km) / AU_KM;
+            let (lo, hi) = match body {
+                BodyId::Pluto => (29.0, 50.0),
+                BodyId::Ceres | BodyId::Vesta | BodyId::Pallas | BodyId::Hygiea => (2.0, 3.6),
+                _ => (0.3, 31.0),
+            };
+            assert!((lo..hi).contains(&r), "{} at r = {r:.2} AU", body.name());
+        }
+    }
+}
+
+/// The solver inherits the determinism rule: same seed + config, bit-identical
+/// search trajectory. Also sanity-checks the search actually converges toward
+/// its target rather than wandering.
+#[test]
+fn solver_is_deterministic_and_converges() {
+    use crate::solver::{Search, SolverConfig};
+    let (eph, _) = Ephemeris::load();
+    let cfg = SolverConfig::default();
+    let epoch0 = j2000() + Duration::from_days(9000.0);
+
+    let run = || {
+        let mut s = Search::new(&eph, cfg.clone(), epoch0, None);
+        let mut first = f64::NAN;
+        let mut last = f64::NAN;
+        for i in 0..8 {
+            let (_, (score, _)) = s.step(&eph);
+            if i == 0 {
+                first = score;
+            }
+            last = score;
+        }
+        (first, last)
+    };
+    let (a_first, a_last) = run();
+    let (b_first, b_last) = run();
+    assert_eq!(a_first.to_bits(), b_first.to_bits(), "search not deterministic");
+    assert_eq!(a_last.to_bits(), b_last.to_bits(), "search not deterministic");
+    assert!(a_last <= a_first, "beam search got worse: {a_first} -> {a_last}");
+}
+
+#[test]
+fn bench_ephemeris_query_cost() {
+    let (eph, label) = Ephemeris::load();
+    let e0 = j2000() + Duration::from_days(9000.0);
+    let t = std::time::Instant::now();
+    let n = 2000;
+    let mut acc = 0.0;
+    for i in 0..n {
+        let s = eph.state(BodyId::Earth, e0 + Duration::from_seconds(i as f64 * 3600.0));
+        acc += s.pos_km[0];
+    }
+    println!(
+        "{label}: {n} Earth queries in {:.2}s ({:.2} ms/query, checksum {acc:.0})",
+        t.elapsed().as_secs_f64(),
+        t.elapsed().as_secs_f64() * 1e3 / n as f64
+    );
+}
+
+#[test]
+fn bench_cached_span_build() {
+    let (eph, _) = Ephemeris::load();
+    let t = std::time::Instant::now();
+    let mask = crate::solver::solver_dynamics().perturbers;
+    let start = j2000() + Duration::from_days(9000.0);
+    let table = eph.cached_span(start, start + Duration::from_days(16.0 * 365.25), &mask);
+    println!("16-year table built in {:.2}s", t.elapsed().as_secs_f64());
+    let s = table.state(BodyId::Mars, start + Duration::from_days(500.0));
+    let r = eph.state(BodyId::Mars, start + Duration::from_days(500.0));
+    let d = ((s.pos_km[0]-r.pos_km[0]).powi(2)+(s.pos_km[1]-r.pos_km[1]).powi(2)+(s.pos_km[2]-r.pos_km[2]).powi(2)).sqrt();
+    println!("Mars interp error {d:.3} km");
+    assert!(d < 50.0);
+}
+
+#[test]
+fn bench_single_eval() {
+    use crate::solver::{Search, SolverConfig};
+    let (eph, _) = Ephemeris::load();
+    let cfg = SolverConfig::default();
+    let epoch0 = j2000() + Duration::from_days(9000.0);
+    let t = std::time::Instant::now();
+    let mut s = Search::new(&eph, cfg.clone(), epoch0, None);
+    println!("Search::new (beam seed, {} evals): {:.2}s", cfg.beam_width, t.elapsed().as_secs_f64());
+    for k in 0..3 {
+        let t = std::time::Instant::now();
+        let _ = s.step(&eph);
+        println!("step {k} ({} evals): {:.2}s", cfg.beam_width * cfg.mutations + 1, t.elapsed().as_secs_f64());
+    }
+}
+
+#[test]
+fn bench_propagate_profiles() {
+    // Isolate where eval time goes: one long propagate at solver fidelity,
+    // once with a healthy Mars-transfer v∞ and once with a near-zero v∞
+    // (the pathological "loiter near Earth" case).
+    let (eph, _) = Ephemeris::load();
+    let dyn_cfg = crate::solver::solver_dynamics();
+    let epoch0 = j2000() + Duration::from_days(9000.0);
+    let span_end = epoch0 + Duration::from_days(1502.0);
+    let fast = eph.cached_span(epoch0 - Duration::from_days(1.0), span_end, &dyn_cfg.perturbers);
+    let earth = fast.state(BodyId::Earth, epoch0);
+    for (label, vinf) in [("mars-like v∞=3.5", [3.0, 1.5, 0.5]), ("pathological v∞≈0", [0.02, 0.0, 0.0])] {
+        let s0 = ScState {
+            pos: [earth.pos_km[0] + 925_000.0, earth.pos_km[1], earth.pos_km[2]],
+            vel: [
+                earth.vel_km_s[0] + vinf[0],
+                earth.vel_km_s[1] + vinf[1],
+                earth.vel_km_s[2] + vinf[2],
+            ],
+        };
+        let t = std::time::Instant::now();
+        let traj = dynamics::propagate(&fast, &dyn_cfg, epoch0, s0, Duration::from_days(600.0), 40);
+        let reached = (traj.last().unwrap().0 - epoch0).to_seconds() / 86400.0;
+        println!("{label}: {:.2}s, reached day {reached:.0}/600, {} samples", t.elapsed().as_secs_f64(), traj.len());
+    }
+}
+
+#[test]
+fn bench_eval_by_candidate() {
+    let (eph, _) = Ephemeris::load();
+    let dyn_cfg = crate::solver::solver_dynamics();
+    let epoch0 = j2000() + Duration::from_days(9000.0);
+    let span_end = epoch0 + Duration::from_days(1502.0);
+    let fast = eph.cached_span(epoch0 - Duration::from_days(1.0), span_end, &dyn_cfg.perturbers);
+    // Same flavor of xorshift stream the search uses (seed 7).
+    let mut state: u64 = 7;
+    let mut next = move || {
+        let mut x = state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut unit = move || (next() >> 11) as f64 / (1u64 << 53) as f64;
+    for k in 0..12 {
+        let depart_days = unit() * 900.0;
+        let tof_days = 60.0 + unit() * 540.0;
+        let vinf = [
+            unit() * 10.0 - 5.0,
+            unit() * 10.0 - 5.0,
+            unit() * 4.0 - 2.0,
+        ];
+        let depart = epoch0 + Duration::from_seconds(depart_days * 86400.0);
+        let earth = fast.state(BodyId::Earth, depart);
+        let vmag = (vinf[0] * vinf[0] + vinf[1] * vinf[1] + vinf[2] * vinf[2])
+            .sqrt()
+            .max(1e-6);
+        let s0 = ScState {
+            pos: [
+                earth.pos_km[0] + vinf[0] / vmag * 925_000.0,
+                earth.pos_km[1] + vinf[1] / vmag * 925_000.0,
+                earth.pos_km[2] + vinf[2] / vmag * 925_000.0,
+            ],
+            vel: [
+                earth.vel_km_s[0] + vinf[0],
+                earth.vel_km_s[1] + vinf[1],
+                earth.vel_km_s[2] + vinf[2],
+            ],
+        };
+        let t = std::time::Instant::now();
+        let traj = dynamics::propagate(
+            &fast,
+            &dyn_cfg,
+            depart,
+            s0,
+            Duration::from_seconds(tof_days * 86400.0),
+            40,
+        );
+        println!(
+            "cand {k}: depart {depart_days:5.0}d tof {tof_days:4.0}d vinf [{:+.1} {:+.1} {:+.1}] -> {:.2}s ({} pts)",
+            vinf[0], vinf[1], vinf[2],
+            t.elapsed().as_secs_f64(),
+            traj.len()
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Lambert solver sanity: the returned conic must conserve energy and
+/// angular momentum between its endpoints, and a near-Hohmann geometry
+/// (178° transfer at half-ellipse TOF) must come out near the analytic
+/// Hohmann speeds.
+#[test]
+fn lambert_conserves_and_matches_hohmann() {
+    use crate::solver::lambert;
+    let mu = BodyId::Sun.gm();
+    let r1v = [1.0 * AU_KM, 0.0, 0.0];
+
+    // General geometry: 120°, 200 days.
+    let th = 120f64.to_radians();
+    let r2n_g = 1.4 * AU_KM;
+    let r2v = [r2n_g * th.cos(), r2n_g * th.sin(), 0.0];
+    let (v1, v2) = lambert(r1v, r2v, 200.0 * 86_400.0, mu).expect("lambert 120°");
+    let energy = |r: [f64; 3], v: [f64; 3]| {
+        let rn = (r[0].powi(2) + r[1].powi(2) + r[2].powi(2)).sqrt();
+        (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)) / 2.0 - mu / rn
+    };
+    let hz = |r: [f64; 3], v: [f64; 3]| r[0] * v[1] - r[1] * v[0];
+    let e1 = energy(r1v, v1);
+    let e2 = energy(r2v, v2);
+    assert!(((e1 - e2) / e1).abs() < 1e-9, "energy mismatch {e1} vs {e2}");
+    assert!(
+        ((hz(r1v, v1) - hz(r2v, v2)) / hz(r1v, v1)).abs() < 1e-9,
+        "ang. momentum mismatch"
+    );
+
+    // Near-Hohmann: 178°, half-ellipse TOF, speeds ≈ vis-viva at both ends.
+    let r2n = 1.523_7 * AU_KM;
+    let a = 0.5 * (1.0 * AU_KM + r2n);
+    let tof = std::f64::consts::PI * (a * a * a / mu).sqrt();
+    let th = 178f64.to_radians();
+    let (v1, v2) = lambert(r1v, [r2n * th.cos(), r2n * th.sin(), 0.0], tof, mu)
+        .expect("lambert 178°");
+    let v1n = (v1[0].powi(2) + v1[1].powi(2) + v1[2].powi(2)).sqrt();
+    let v2n = (v2[0].powi(2) + v2[1].powi(2) + v2[2].powi(2)).sqrt();
+    let vis_viva = |r: f64| (mu * (2.0 / r - 1.0 / a)).sqrt();
+    assert!((v1n - vis_viva(1.0 * AU_KM)).abs() < 0.3, "v1 {v1n} vs {}", vis_viva(1.0 * AU_KM));
+    assert!((v2n - vis_viva(r2n)).abs() < 0.3, "v2 {v2n} vs {}", vis_viva(r2n));
+}
+
+/// The headline validation: searching the 2020 window must rediscover the
+/// Mars 2020 (Perseverance) trajectory — launched 2020-07-30, TOF 203 d,
+/// C3 = 14.49 km²/s². We accept the window to within a few days and ~15% C3.
+#[test]
+fn rediscovers_mars_2020_trajectory() {
+    use crate::solver::{Search, SolverConfig};
+    let (eph, label) = Ephemeris::load();
+    if !label.starts_with("SPICE") {
+        eprintln!("kernels absent; skipping");
+        return;
+    }
+    let cfg = SolverConfig::default();
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2020, 1, 1);
+    let mut s = Search::new(&eph, cfg, epoch0, None);
+    let mut top = None;
+    for _ in 0..150 {
+        let (_, t) = s.step(&eph);
+        top = Some(t);
+    }
+    let (_, g) = top.unwrap();
+    let sol = s.solution_for(&eph, &g);
+    let (y, m, d, ..) = sol.depart.to_gregorian_utc();
+    let c3 = sol.vinf_dep_kms * sol.vinf_dep_kms;
+    println!(
+        "found depart {y:04}-{m:02}-{d:02}, TOF {:.0} d, C3 {c3:.1} km2/s2, arr v∞ {:.2}",
+        g.total_tof_days(), sol.vinf_arr_kms
+    );
+    assert_eq!(y, 2020);
+    assert!(m == 7 || m == 8, "wrong window: month {m}");
+    assert!((150.0..260.0).contains(&g.total_tof_days()), "TOF {}", g.total_tof_days());
+    assert!((11.0..18.0).contains(&c3), "C3 {c3}");
+}
+
+/// Universal-variable Kepler propagation must round-trip: forward dt then
+/// backward dt returns the initial state.
+#[test]
+fn kepler_universal_round_trip() {
+    use crate::solver::kepler_universal;
+    let mu = BodyId::Sun.gm();
+    let r0 = [1.1 * AU_KM, 0.2 * AU_KM, 0.05 * AU_KM];
+    let v0 = [-5.0, 28.0, 1.0];
+    let dt = 250.0 * 86_400.0;
+    let (r1, v1) = kepler_universal(r0, v0, dt, mu);
+    let (r2, v2) = kepler_universal(r1, v1, -dt, mu);
+    for k in 0..3 {
+        assert!((r2[k] - r0[k]).abs() < 1.0, "pos {k}: {} vs {}", r2[k], r0[k]);
+        assert!((v2[k] - v0[k]).abs() < 1e-6, "vel {k}");
+    }
+}
+
+/// Multi-rev Lambert: adding one transfer-ellipse period to the TOF and
+/// requesting revs=1 must recover (nearly) the same conic as the single-rev
+/// solution — it is the same ellipse flown once more around.
+#[test]
+fn lambert_multirev_recovers_same_ellipse() {
+    use crate::solver::{lambert, lambert_rev};
+    let mu = BodyId::Sun.gm();
+    let r1v = [1.0 * AU_KM, 0.0, 0.0];
+    let th = 120f64.to_radians();
+    let r2v = [1.4 * AU_KM * th.cos(), 1.4 * AU_KM * th.sin(), 0.0];
+    let tof = 200.0 * 86_400.0;
+    let (v1, _) = lambert(r1v, r2v, tof, mu).expect("single rev");
+    // Period of that transfer ellipse.
+    let r1n = 1.0 * AU_KM;
+    let v1n2 = v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2];
+    let a = 1.0 / (2.0 / r1n - v1n2 / mu);
+    let period = 2.0 * std::f64::consts::PI * (a * a * a / mu).sqrt();
+    // The m=1 TOF curve is U-shaped: two conics solve it, and the re-flown
+    // original ellipse is one of them — on whichever branch. Accept either.
+    let candidates: Vec<[f64; 3]> = [false, true]
+        .iter()
+        .filter_map(|hb| lambert_rev(r1v, r2v, tof + period, mu, 1, *hb).map(|(w1, _)| w1))
+        .collect();
+    assert!(!candidates.is_empty(), "no multi-rev solution");
+    let matched = candidates.iter().any(|w1| {
+        (0..3).all(|k| (w1[k] - v1[k]).abs() < 0.05)
+    });
+    assert!(matched, "no branch recovered the original ellipse: {candidates:?} vs {v1:?}");
+}
+
+/// Tour evaluation smoke: a VEEGA search must produce feasible Lambert legs
+/// (score ≪ the failure sentinel) and one Flyby record per route body.
+#[test]
+fn veega_tour_search_is_sane() {
+    use crate::solver::{Search, SolverConfig};
+    let (eph, _) = Ephemeris::load();
+    let mut cfg = SolverConfig::default();
+    cfg.target = BodyId::Jupiter;
+    cfg.route = vec![BodyId::Venus, BodyId::Earth, BodyId::Earth];
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2028, 1, 1);
+    let mut s = Search::new(&eph, cfg, epoch0, None);
+    let mut top = None;
+    for _ in 0..40 {
+        let (_, t) = s.step(&eph);
+        top = Some(t);
+    }
+    let (score, g) = top.unwrap();
+    let sol = s.solution_for(&eph, &g);
+    assert!(score < 1e3, "no feasible tour found, score {score}");
+    assert_eq!(sol.flybys.len(), 3);
+    assert!(sol.vinf_dep_kms > 0.5 && sol.vinf_dep_kms < 15.0);
+    // Patched-conic legs land exactly on the target by construction.
+    assert_eq!(sol.miss_km, 0.0);
+}
+
+/// Two-phase pipeline: beam search scouts to ~1e5 km, then the differential
+/// corrector must drive the full-fidelity miss to km-scale.
+#[test]
+fn differential_correction_hits_target() {
+    use crate::solver::{differential_correct, Search, SolverConfig};
+    let (eph, label) = Ephemeris::load();
+    if !label.starts_with("SPICE") {
+        eprintln!("kernels absent; skipping");
+        return;
+    }
+    let cfg = SolverConfig::default();
+    let epoch0 = j2000() + Duration::from_days(9000.0);
+    let mut s = Search::new(&eph, cfg.clone(), epoch0, None);
+    let mut top = None;
+    for _ in 0..60 {
+        let (_, t) = s.step(&eph);
+        top = Some(t);
+    }
+    let (_, g) = top.unwrap();
+    let sol = s.solution_for(&eph, &g);
+    let full = crate::solver::solver_dynamics(); // full catalog, search tol
+    let (_, miss) = differential_correct(
+        &eph,
+        &full,
+        sol.depart,
+        Duration::from_days(g.total_tof_days()),
+        cfg.target,
+        g.vinf_dep,
+    );
+    assert!(
+        miss < 5_000.0,
+        "corrector left {miss:.0} km miss (started ~{:.0})",
+        sol.miss_km
+    );
+}
+
+/// Multi-leg shooting: a scouted Venus-assist tour to Mars must refine into
+/// continuous n-body legs that each hit their patch body to km-scale.
+#[test]
+fn tour_refines_to_mission_grade() {
+    use crate::solver::{refine_tour, Search, SolverConfig};
+    let (eph, label) = Ephemeris::load();
+    if !label.starts_with("SPICE") {
+        eprintln!("kernels absent; skipping");
+        return;
+    }
+    let mut cfg = SolverConfig::default();
+    cfg.target = BodyId::Mars;
+    cfg.route = vec![BodyId::Venus];
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2028, 1, 1);
+    let mut s = Search::new(&eph, cfg.clone(), epoch0, None);
+    let mut top = None;
+    for _ in 0..60 {
+        let (_, t) = s.step(&eph);
+        top = Some(t);
+    }
+    let (score, g) = top.unwrap();
+    assert!(score < 1e3, "no feasible scout tour, score {score}");
+    let rt = refine_tour(&eph, &cfg, epoch0, &g).expect("refinement failed");
+    assert!(
+        rt.worst_miss_km < 5_000.0,
+        "worst leg miss {:.0} km after shooting",
+        rt.worst_miss_km
+    );
+    assert_eq!(rt.flybys.len(), 1);
+    assert!(rt.traj.len() > 400, "dense trajectory expected");
+}
+
+/// GPU porkchop must run headless without tripping wgpu validation (a shader
+/// or layout error panics the whole app when clicked in the UI).
+#[test]
+fn gpu_porkchop_computes() {
+    use eframe::egui_wgpu::wgpu;
+    // Tiny block_on: busy-poll with a no-op waker (no async runtime in deps).
+    fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop_raw() -> RawWaker {
+            fn clone(_: *const ()) -> RawWaker { noop_raw() }
+            fn noop(_: *const ()) {}
+            RawWaker::new(std::ptr::null(), &RawWakerVTable::new(clone, noop, noop, noop))
+        }
+        let waker = unsafe { Waker::from_raw(noop_raw()) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+            std::thread::yield_now();
+        }
+    }
+    let instance = wgpu::Instance::default();
+    let adapter = match block_on(instance.request_adapter(&Default::default())) {
+        Some(a) => a,
+        None => {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        }
+    };
+    let (device, queue) =
+        block_on(adapter.request_device(&Default::default(), None)).expect("device");
+    device.on_uncaptured_error(Box::new(|e| panic!("wgpu error: {e}")));
+    let eph = Ephemeris::Kepler;
+    let pc = crate::porkchop::compute(
+        &device,
+        &queue,
+        &eph,
+        BodyId::Mars,
+        crate::porkchop::GridSpec {
+            start: j2000() + Duration::from_days(9000.0),
+            window_days: 900.0,
+            tof_min_days: 60.0,
+            tof_max_days: 600.0,
+        },
+    )
+    .expect("gpu compute failed");
+    let valid = pc.grid.iter().filter(|c| c[0] < 1e6).count();
+    println!("porkchop: {}/{} cells solved", valid, pc.grid.len());
+    assert!(valid > pc.grid.len() / 4, "too few Lambert solutions: {valid}");
+    // Spot-check one good cell against the CPU f64 Lambert.
+    let (i, j) = (crate::porkchop::NX / 2, crate::porkchop::NY / 2);
+    let [vd, _] = pc.cell(i, j);
+    assert!(vd > 0.1 && vd < 50.0, "midgrid v∞ dep {vd}");
+}
+
+/// Low-thrust physics: a year of full along-track NEXT-C thrust must raise
+/// the orbit's energy and add Δv ≈ a·t (within geometry effects).
+#[test]
+fn low_thrust_changes_orbit_as_expected() {
+    use crate::dynamics::{propagate, propagate_thrusted, Thrust};
+    let eph = Ephemeris::Kepler;
+    let cfg = DynamicsConfig::default();
+    let epoch = j2000();
+    let r0 = 1.0 * AU_KM;
+    let s0 = ScState {
+        pos: [r0, 0.0, 0.0],
+        vel: [0.0, dynamics::circular_speed_kms(r0), 0.0],
+    };
+    let year = Duration::from_days(365.25);
+    let accel = crate::solver::Engine::NextC.accel_kms2();
+    let segs = [[1.0, 0.0, 0.0]; 4];
+    let thrust = Thrust {
+        segs: &segs,
+        accel_kms2: accel,
+        total_s: year.to_seconds(),
+    };
+    let coast = propagate(&eph, &cfg, epoch, s0, year, 4);
+    let burn = propagate_thrusted(&eph, &cfg, epoch, s0, year, 4, Some(&thrust));
+    let energy = |s: &ScState| {
+        let r = (s.pos[0].powi(2) + s.pos[1].powi(2) + s.pos[2].powi(2)).sqrt();
+        (s.vel[0].powi(2) + s.vel[1].powi(2) + s.vel[2].powi(2)) / 2.0 - BodyId::Sun.gm() / r
+    };
+    let de = energy(&burn.last().unwrap().1) - energy(&coast.last().unwrap().1);
+    assert!(de > 0.0, "prograde thrust must raise orbital energy");
+    let dv_expected = accel * year.to_seconds();
+    // Semi-major axis growth implies the burn actually delivered km/s-scale Δv.
+    assert!(
+        dv_expected > 5.0 && dv_expected < 15.0,
+        "NEXT-C pair should deliver ~10 km/s/yr, got {dv_expected}"
+    );
+}
+
+/// SEP search smoke: a NEXT-C Pluto orbiter search must produce candidates
+/// that actually burn propellant and stay within the modeled budget.
+#[test]
+fn sep_pluto_search_uses_thrust() {
+    use crate::solver::{Engine, Search, SolverConfig};
+    let (eph, label) = Ephemeris::load();
+    if !label.starts_with("SPICE") {
+        eprintln!("kernels absent; skipping");
+        return;
+    }
+    let mut cfg = SolverConfig::default();
+    cfg.target = BodyId::Pluto;
+    cfg.engine = Engine::NextC;
+    cfg.auto_route = false;
+    cfg.beam_width = 6;
+    cfg.mutations = 4;
+    cfg.scale_tof_to_target();
+    cfg.tof_max_days = cfg.tof_max_days.min(15_000.0);
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2030, 1, 1);
+    let mut s = Search::new(&eph, cfg.clone(), epoch0, None);
+    let mut top = None;
+    for _ in 0..5 {
+        let (_, t) = s.step(&eph);
+        top = Some(t);
+    }
+    let (score, g) = top.unwrap();
+    let sol = s.solution_for(&eph, &g);
+    assert!(score.is_finite());
+    assert!(
+        sol.thrust_dv_kms > 0.5,
+        "SEP candidate is not thrusting ({:.2} km/s)",
+        sol.thrust_dv_kms
+    );
+    assert!(sol.thrust_dv_kms < cfg.engine.max_dv_kms() * 1.5);
+}

@@ -1,0 +1,24 @@
+[package]
+name = "Orbital"
+version = "0.1.0"
+edition = "2021"
+
+# Pinned to the Rune ecosystem line (wgpu 22.1.0). Do NOT bump these
+# independently of livewall-studio.
+[dependencies]
+egui = "0.29.1"
+eframe = { version = "0.29.1", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+hifitime = "4"
+anise = { version = "0.6", optional = true }
+
+[features]
+default = ["spice"]
+# DE440 ephemeris support via ANISE; falls back to built-in Keplerian
+# elements when data/de440s.bsp is absent or the feature is off.
+spice = ["dep:anise"]
+
+# The Rune fork of egui-winit (wlr-data-control clipboard). Same pin as cauldron.
+[patch.crates-io]
+egui-winit = { path = "/home/coffee/RustroverProjects/livewall-studio/vendor/egui-winit" }

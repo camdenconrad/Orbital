@@ -1,0 +1,7 @@
+/target
+.venv/
+__pycache__/
+
+# JPL ephemeris kernels (32 MB; fetch from naif.jpl.nasa.gov)
+data/*.bsp
+.coven/
