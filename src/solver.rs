@@ -357,14 +357,31 @@ pub struct Genome {
     pub thrust: Vec<[f64; 3]>,
     /// Per-leg deep-space maneuver, one entry per leg: `[frac, dvx, dvy, dvz]`.
     /// `frac` is where along the leg the burn happens (fraction of the leg's
-    /// TOF); the vector is a km/s kick applied to the leg's *departure*
-    /// velocity, after which a second Lambert arc closes onto the arrival
-    /// node and the mismatch it needs is charged as the real DSM Δv. This is
-    /// the standard MGA-1DSM parameterization, and it degenerates *exactly*
-    /// to the ballistic leg at `dv = 0` — so enabling DSMs can never make a
-    /// tour worse, only open extra freedom (the VEEGA/EGA-enabling one).
-    /// Empty = ballistic tour.
+    /// TOF); the vector is the **burn itself**, in km/s, applied to the
+    /// spacecraft's heliocentric velocity *at the maneuver point*. The leg's
+    /// departure velocity is then whatever makes that burn close onto the
+    /// arrival node (see [`solve_leg`]), so the genome vector and the Δv the
+    /// score charges are one and the same quantity — the standard MGA-1DSM
+    /// parameterization, where the maneuver is the decision variable and the
+    /// departure state is the dependent one.
+    ///
+    /// Because the departure velocity is solved by shooting from the
+    /// ballistic Lambert arc as its seed, the leg tends to that same arc
+    /// *continuously* as `dv → 0`, not merely at exactly zero. Empty =
+    /// ballistic tour.
     pub dsm: Vec<[f64; 4]>,
+    /// Per-leg Lambert branch selector, one entry per leg. Legs commonly have
+    /// several arcs that fit the same (r1, r2, TOF) — different revolution
+    /// counts, and the low/high branch of each multi-rev family. Index 0 is
+    /// the arc with the cheapest departure v∞ (the historical greedy pick);
+    /// higher indices are the alternatives, ordered deterministically by
+    /// [`lambert_candidates`] and wrapped modulo the number available.
+    ///
+    /// Making this a gene is the point: a locally cheap departure can be a
+    /// globally worse tour once the flyby turn limit, arrival v∞ and capture
+    /// burn are counted, and only the full mission score can see that. Empty
+    /// (or short) = branch 0 for every leg.
+    pub branch: Vec<u32>,
 }
 
 impl Genome {
@@ -377,6 +394,11 @@ impl Genome {
         self.dsm
             .get(i)
             .filter(|d| d[1] != 0.0 || d[2] != 0.0 || d[3] != 0.0)
+    }
+
+    /// The Lambert branch selected for leg `i` (0 when unset).
+    fn leg_branch(&self, i: usize) -> u32 {
+        self.branch.get(i).copied().unwrap_or(0)
     }
 }
 
@@ -624,12 +646,15 @@ pub fn lambert_rev(
 /// anything a mission would fly, and each extra `m` costs two bisections.
 const MAX_LAMBERT_REVS: u32 = 20;
 
-/// Largest revolution count that can possibly solve this geometry in `tof_s`.
+/// Largest revolution count swept for this geometry in `tof_s`.
 ///
 /// The m-rev branch only exists once the TOF exceeds the m-rev minimum, which
 /// is itself strictly greater than `m` periods of the minimum-energy transfer
-/// ellipse (`a_min = s/2`, `s` the triangle semiperimeter). So
-/// `floor(tof / T_min)` is a tight, cheap upper bound — no magic constant.
+/// ellipse (`a_min = s/2`, `s` the triangle semiperimeter), so
+/// `floor(tof / T_min)` is a tight geometric upper bound. The value returned
+/// is that bound *clamped to [`MAX_LAMBERT_REVS`]*: for a long TOF against a
+/// small transfer ellipse the geometric bound alone runs to hundreds, so the
+/// sweep is deliberately truncated and is not exhaustive in that regime.
 fn max_revs(r1: [f64; 3], r2: [f64; 3], tof_s: f64, mu: f64) -> u32 {
     let n = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     let (r1n, r2n) = (n(r1), n(r2));
@@ -645,14 +670,67 @@ fn max_revs(r1: [f64; 3], r2: [f64; 3], tof_s: f64, mu: f64) -> u32 {
     ((tof_s / t_min).floor().max(0.0) as u32).min(MAX_LAMBERT_REVS)
 }
 
-/// Best Lambert conic for a leg: sweep every feasible revolution count and
-/// both multi-rev branches, and keep whichever arc leaves the start node with
-/// the velocity closest to `vref` (the departure body's own velocity — i.e.
-/// the cheapest v∞).
+/// Every Lambert conic that fits this leg: the single-rev arc plus both
+/// branches of every revolution count the geometry admits, up to
+/// [`MAX_LAMBERT_REVS`] (see [`max_revs`]).
 ///
-/// This is the single entry point for leg solving; the revolution ceiling
-/// comes from the geometry (see [`max_revs`]), never a hardcoded TOF.
-/// Deterministic: fixed sweep order, ties broken by first-seen.
+/// Ordered by departure cost — `|v1 - vref|`, i.e. cheapest v∞ off the start
+/// node — so index 0 is the locally best arc and the rest are the genuine
+/// alternatives a caller may want to score against the *whole* mission
+/// instead of committing greedily. Deterministic: fixed sweep order, and the
+/// sort is stable so ties keep first-seen order.
+pub fn lambert_candidates(
+    r1: [f64; 3],
+    r2: [f64; 3],
+    tof_s: f64,
+    mu: f64,
+    vref: [f64; 3],
+) -> Vec<([f64; 3], [f64; 3])> {
+    let cost = |o: &([f64; 3], [f64; 3])| {
+        let d = [o.0[0] - vref[0], o.0[1] - vref[1], o.0[2] - vref[2]];
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+    };
+    let mut out: Vec<([f64; 3], [f64; 3])> = Vec::new();
+    let consider = |out: &mut Vec<_>, o: Option<([f64; 3], [f64; 3])>| {
+        if let Some(v) = o {
+            if v.0.iter().chain(v.1.iter()).all(|c: &f64| c.is_finite()) {
+                out.push(v);
+            }
+        }
+    };
+    consider(&mut out, lambert_rev(r1, r2, tof_s, mu, 0, false));
+    for m in 1..=max_revs(r1, r2, tof_s, mu) {
+        consider(&mut out, lambert_rev(r1, r2, tof_s, mu, m, false));
+        consider(&mut out, lambert_rev(r1, r2, tof_s, mu, m, true));
+    }
+    out.sort_by(|a, b| cost(a).total_cmp(&cost(b)));
+    out
+}
+
+/// The `k`-th cheapest Lambert arc for a leg, wrapping modulo the number
+/// available so any branch gene value is valid. `k = 0` is [`lambert_best`].
+fn lambert_branch(
+    r1: [f64; 3],
+    r2: [f64; 3],
+    tof_s: f64,
+    mu: f64,
+    vref: [f64; 3],
+    k: u32,
+) -> Option<([f64; 3], [f64; 3])> {
+    let c = lambert_candidates(r1, r2, tof_s, mu, vref);
+    if c.is_empty() {
+        return None;
+    }
+    Some(c[k as usize % c.len()])
+}
+
+/// The arc leaving the start node with the velocity closest to `vref` (the
+/// departure body's own velocity — i.e. the cheapest v∞).
+///
+/// This is a *local* criterion: it sees neither the incoming flyby velocity,
+/// nor the arrival v∞, nor the next leg. Callers that care about the tour as
+/// a whole should use [`lambert_candidates`] and score the alternatives —
+/// which is what the per-leg branch gene ([`Genome::branch`]) exists for.
 pub fn lambert_best(
     r1: [f64; 3],
     r2: [f64; 3],
@@ -660,27 +738,7 @@ pub fn lambert_best(
     mu: f64,
     vref: [f64; 3],
 ) -> Option<([f64; 3], [f64; 3])> {
-    let cost = |o: &([f64; 3], [f64; 3])| {
-        let d = [o.0[0] - vref[0], o.0[1] - vref[1], o.0[2] - vref[2]];
-        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
-    };
-    let mut best: Option<([f64; 3], [f64; 3])> = None;
-    let mut consider = |o: Option<([f64; 3], [f64; 3])>| {
-        if let Some(v) = o {
-            if !v.0.iter().chain(v.1.iter()).all(|c| c.is_finite()) {
-                return;
-            }
-            if best.as_ref().is_none_or(|b| cost(&v) < cost(b)) {
-                best = Some(v);
-            }
-        }
-    };
-    consider(lambert_rev(r1, r2, tof_s, mu, 0, false));
-    for m in 1..=max_revs(r1, r2, tof_s, mu) {
-        consider(lambert_rev(r1, r2, tof_s, mu, m, false));
-        consider(lambert_rev(r1, r2, tof_s, mu, m, true));
-    }
-    best
+    lambert_candidates(r1, r2, tof_s, mu, vref).into_iter().next()
 }
 
 /// Where along a leg a DSM may sit. Burning in the first/last few percent of
@@ -701,12 +759,136 @@ struct LegArc {
     dsm: Option<(f64, [f64; 3], [f64; 3])>,
 }
 
+/// How closely the DSM shooter must close onto the arrival node, km. Six
+/// orders of magnitude below an AU: far tighter than the patched-conic model
+/// is meaningful to, so the shot is exact as far as the score can tell.
+const DSM_SHOOT_TOL_KM: f64 = 1.0e-3;
+
+/// Solve for the leg-departure velocity that makes a *given* mid-leg burn
+/// close onto the arrival node.
+///
+/// This is the inversion that makes the genome's vector the real maneuver:
+/// coast `t1` from `r1`, add `dv` to the velocity there, coast the remaining
+/// `t2`, and require the endpoint to be `r2`. Three equations, three unknowns
+/// (the departure velocity), seeded with the ballistic Lambert arc `v_seed`.
+///
+/// At `dv = 0` the seed is already the exact solution, and the residual is
+/// smooth in `dv`, so the converged departure velocity — and hence every
+/// state on the leg — varies *continuously* through zero. Nothing here picks
+/// a revolution count or a branch, so nothing can flip discontinuously under
+/// an arbitrarily small kick.
+///
+/// Returns `(v_dep, rm, v_after_burn)`, or `None` if the shot did not close.
+fn shoot_dsm_leg(
+    r1: [f64; 3],
+    r2: [f64; 3],
+    t1: f64,
+    t2: f64,
+    mu: f64,
+    dv: [f64; 3],
+    v_seed: [f64; 3],
+) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
+    let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    // Fly the leg for a trial departure velocity: (miss vector, rm, v_after).
+    let fly = |v: [f64; 3]| -> Option<([f64; 3], [f64; 3], [f64; 3])> {
+        let (rm, vm) = kepler_universal(r1, v, t1, mu);
+        if !rm.iter().chain(vm.iter()).all(|c| c.is_finite()) {
+            return None;
+        }
+        let v_after = [vm[0] + dv[0], vm[1] + dv[1], vm[2] + dv[2]];
+        let (rf, _) = kepler_universal(rm, v_after, t2, mu);
+        if !rf.iter().all(|c| c.is_finite()) {
+            return None;
+        }
+        Some(([rf[0] - r2[0], rf[1] - r2[1], rf[2] - r2[2]], rm, v_after))
+    };
+
+    let mut v = v_seed;
+    let (mut f, mut rm, mut v_after) = fly(v)?;
+    let (mut best, mut best_norm, mut best_rm, mut best_va) = (v, norm(f), rm, v_after);
+    for _ in 0..20 {
+        if best_norm < DSM_SHOOT_TOL_KM {
+            break;
+        }
+        // Relative finite-difference step: the conics are analytic, so the
+        // only floor is round-off, and scaling with |v| keeps the Jacobian
+        // conditioned across the inner-planet/outer-planet velocity range.
+        let h = 1e-7 * norm(v).max(1.0);
+        let mut jac = [[0.0f64; 3]; 3];
+        for c in 0..3 {
+            let mut vp = v;
+            vp[c] += h;
+            let (fp, _, _) = fly(vp)?;
+            for r in 0..3 {
+                jac[r][c] = (fp[r] - f[r]) / h;
+            }
+        }
+        let det = jac[0][0] * (jac[1][1] * jac[2][2] - jac[1][2] * jac[2][1])
+            - jac[0][1] * (jac[1][0] * jac[2][2] - jac[1][2] * jac[2][0])
+            + jac[0][2] * (jac[1][0] * jac[2][1] - jac[1][1] * jac[2][0]);
+        if det == 0.0 || !det.is_finite() {
+            break;
+        }
+        let rhs = [-f[0], -f[1], -f[2]];
+        let solve_col = |col: usize| {
+            let mut m = jac;
+            for r in 0..3 {
+                m[r][col] = rhs[r];
+            }
+            (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+                / det
+        };
+        let step = [solve_col(0), solve_col(1), solve_col(2)];
+        if !step.iter().all(|c| c.is_finite()) {
+            break;
+        }
+        // Backtrack until the step actually improves the miss.
+        let mut scale = 1.0;
+        let mut stepped = false;
+        for _ in 0..8 {
+            let trial = [v[0] + step[0] * scale, v[1] + step[1] * scale, v[2] + step[2] * scale];
+            if let Some((ft, rmt, vat)) = fly(trial) {
+                if norm(ft) < norm(f) {
+                    v = trial;
+                    f = ft;
+                    rm = rmt;
+                    v_after = vat;
+                    stepped = true;
+                    break;
+                }
+            }
+            scale *= 0.5;
+        }
+        if !stepped {
+            break;
+        }
+        if norm(f) < best_norm {
+            best = v;
+            best_norm = norm(f);
+            best_rm = rm;
+            best_va = v_after;
+        }
+    }
+    // A leg that never closed is not a leg: reporting its unconverged
+    // endpoint would credit the tour with an arrival it does not make.
+    if best_norm > 1.0 {
+        return None;
+    }
+    Some((best, best_rm, best_va))
+}
+
 /// Solve one leg from `r1` to `r2` in `tof_s`.
 ///
-/// Ballistic (`dsm = None`): a single [`lambert_best`] arc. With a DSM: kick
-/// the departure velocity by the genome's vector, coast that conic to the
-/// maneuver point, then solve a second Lambert arc onto the arrival node —
-/// the velocity discontinuity there is the DSM Δv the score pays for.
+/// Ballistic (`dsm = None`): one Lambert arc, the `branch`-th cheapest.
+///
+/// With a DSM, the genome *is* the maneuver: burn `d[1..4]` at the point
+/// `d[0]` of the way through the leg, and let the departure velocity be
+/// whatever closes that trajectory onto the arrival node (see
+/// [`shoot_dsm_leg`]). The Δv charged is exactly the genome vector's
+/// magnitude — the burn the spacecraft actually performs — and the leg
+/// approaches the ballistic arc continuously as the burn goes to zero.
 fn solve_leg(
     r1: [f64; 3],
     r2: [f64; 3],
@@ -714,28 +896,26 @@ fn solve_leg(
     mu: f64,
     vref: [f64; 3],
     dsm: Option<&[f64; 4]>,
+    branch: u32,
 ) -> Option<LegArc> {
-    let (v1, v2) = lambert_best(r1, r2, tof_s, mu, vref)?;
+    let (v1, v2) = lambert_branch(r1, r2, tof_s, mu, vref, branch)?;
     let Some(d) = dsm else {
         return Some(LegArc { v_start: v1, v_end: v2, dsm_dv: 0.0, dsm: None });
     };
     let frac = d[0].clamp(DSM_FRAC_RANGE.0, DSM_FRAC_RANGE.1);
     let t1 = frac * tof_s;
-    let v_start = [v1[0] + d[1], v1[1] + d[2], v1[2] + d[3]];
-    let (rm, vm) = kepler_universal(r1, v_start, t1, mu);
-    if !rm.iter().chain(vm.iter()).all(|c| c.is_finite()) {
+    let dv = [d[1], d[2], d[3]];
+    let (v_start, rm, v_after) = shoot_dsm_leg(r1, r2, t1, tof_s - t1, mu, dv, v1)?;
+    // The arrival velocity is the one the shot actually delivers.
+    let (_, v_end) = kepler_universal(rm, v_after, tof_s - t1, mu);
+    if !v_end.iter().all(|c| c.is_finite()) {
         return None;
     }
-    // vref = vm: of the arcs that close onto the arrival node, prefer the one
-    // needing the smallest burn.
-    let (vm_req, v_end) = lambert_best(rm, r2, tof_s - t1, mu, vm)?;
-    let dv = [vm_req[0] - vm[0], vm_req[1] - vm[1], vm_req[2] - vm[2]];
-    let dsm_dv = (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt();
     Some(LegArc {
         v_start,
         v_end,
-        dsm_dv,
-        dsm: Some((t1, rm, vm_req)),
+        dsm_dv: (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt(),
+        dsm: Some((t1, rm, v_after)),
     })
 }
 
@@ -831,21 +1011,49 @@ pub fn evaluate(
     }
 }
 
+/// Score offset marking a candidate the selected hardware cannot fly at all.
+///
+/// Every feasible score is a sum of km/s-scale terms and miss penalties that
+/// stay far below this, so adding it is a strict lexicographic demotion: no
+/// infeasible candidate can ever outrank a feasible one, however attractive
+/// its objective.
+const INFEASIBLE_SCORE: f64 = 1.0e9;
+
 /// Shared mission scoring: the objective plus the hardware-feasibility terms
-/// every evaluator must charge. Currently that is the launcher C3 cap —
-/// `vinf_dep² > C3_max` means the trajectory cannot be flown by the selected
-/// launch vehicle at all, so it is charged far above any miss penalty and can
-/// never outrank a feasible candidate. `extra` carries evaluator-specific
-/// terms (miss, propellant, flyby Δv) already summed by the caller.
+/// every evaluator must charge. `extra` carries evaluator-specific terms
+/// (miss, propellant, flyby Δv) already summed by the caller.
+///
+/// **Hardware capability is a hard bound, not a purchasable penalty.** The
+/// launch vehicle either has the performance to inject the stack at
+/// `vinf_dep` or it does not, and the tank either holds the propellant the
+/// profile burns or it does not; there is no exchange rate at which a better
+/// arrival buys the missing launch energy or the missing propellant. So
+/// exceeding either demotes the candidate below every feasible one outright,
+/// rather than adding a weighted soft term it could outbid.
+///
+/// The old C3 form added `5 * max(v∞² - C3max, 0)`: a km²/s² quantity summed
+/// against km/s Δv under an underived weight. What remains past the bound is
+/// the shortfall expressed in the same unit as everything else it sits beside
+/// — km/s — purely so the search still sees a downhill gradient back into the
+/// feasible region. `hw_over_kms` carries any *other* hardware shortfall the
+/// evaluator knows about (the propellant overrun, for the SEP profile),
+/// already in km/s.
 fn mission_score(
     cfg: &SolverConfig,
     vinf_dep: f64,
     arrival_dv: f64,
     tof_days: f64,
     extra: f64,
+    hw_over_kms: f64,
 ) -> f64 {
-    let c3_over = (vinf_dep * vinf_dep - cfg.launcher.c3_max()).max(0.0);
-    cfg.objective.score(vinf_dep, arrival_dv, tof_days) + extra + c3_over * 5.0
+    let base = cfg.objective.score(vinf_dep, arrival_dv, tof_days) + extra;
+    let vinf_max = cfg.launcher.c3_max().sqrt();
+    let over = (vinf_dep - vinf_max).max(0.0) + hw_over_kms.max(0.0);
+    if over > 0.0 {
+        INFEASIBLE_SCORE + base + over
+    } else {
+        base
+    }
 }
 
 /// Score for a candidate whose propagation ran out of integrator steps. The
@@ -971,12 +1179,12 @@ fn evaluate_lowthrust(
 
     let arrival_dv = arrival_dv_kms(cfg.target, v_rel, cfg.mission);
     let excess_miss = (miss_km - soi_km(eph, cfg.target, arrive)).max(0.0);
-    // Launcher C3 cap and propellant budget, charged steeply past the limit.
+    // Propellant past the tank is the same kind of statement as launch energy
+    // past the rocket: not an expensive option, an unavailable one. Both are
+    // handled as hard bounds in `mission_score` — a candidate that "arrives"
+    // on a launcher or a tank that doesn't exist must never outrank a
+    // feasible candidate that still has distance to close.
     let prop_over = (thrust_dv - cfg.engine.max_dv_kms()).max(0.0);
-    // Hardware violations are charged far above any miss penalty (the launcher
-    // C3 term lives in `mission_score`): a candidate that "arrives" on a
-    // launcher or tank that doesn't exist must never outrank a feasible
-    // candidate that still has distance to close.
     let score = mission_score(
         cfg,
         vinf_dep,
@@ -984,8 +1192,8 @@ fn evaluate_lowthrust(
         g.legs[0],
         thrust_dv * 0.25 // propellant is cheaper than launch/capture Δv
             + excess_miss * 1e-6
-            + miss_km * 3e-8
-            + prop_over * 50.0,
+            + miss_km * 3e-8,
+        prop_over,
     );
 
     Solution {
@@ -1072,6 +1280,7 @@ fn evaluate_tour(
             mu,
             states[i].vel_km_s,
             g.leg_dsm(i),
+            g.leg_branch(i),
         );
         match arc {
             Some(a) => arcs.push(a),
@@ -1135,7 +1344,7 @@ fn evaluate_tour(
     let total_tof = g.total_tof_days();
     let arrival_dv = arrival_dv_kms(cfg.target, vinf_arr, cfg.mission);
     // DSM Δv is real propellant, charged exactly like powered-flyby Δv.
-    let score = mission_score(cfg, vinf_dep, arrival_dv, total_tof, assist_dv + dsm_dv);
+    let score = mission_score(cfg, vinf_dep, arrival_dv, total_tof, assist_dv + dsm_dv, 0.0);
 
     // Sample each conic for rendering — two sub-arcs when the leg has a DSM.
     let per_leg = (n_samples / g.legs.len().max(1)).max(8);
@@ -1271,6 +1480,7 @@ fn evaluate_direct(
         arrival_dv,
         g.legs[0],
         excess * 1e-6 + miss_km * 3e-8,
+        0.0,
     );
 
     Solution {
@@ -1318,6 +1528,9 @@ fn genome_key(g: &Genome) -> u64 {
         for c in &node[1..] {
             mix((c * 100.0) as i64); // 10 m/s buckets, same as v∞
         }
+    }
+    for b in &g.branch {
+        mix(*b as i64); // a different arc is a different trajectory
     }
     h
 }
@@ -1630,12 +1843,17 @@ impl Search {
         } else {
             vec![[0.5, 0.0, 0.0, 0.0]; legs.len()]
         };
+        // Branch 0 on every leg is the cheapest-departure arc — exactly what
+        // the greedy solver used to commit to unconditionally. Seeding it
+        // means the alternatives cost nothing until mutation tries one.
+        let branch = vec![0u32; if self.cfg.route.is_empty() { 0 } else { legs.len() }];
         Genome {
             depart_days,
             legs,
             vinf_dep,
             thrust,
             dsm,
+            branch,
         }
     }
 
@@ -1693,7 +1911,19 @@ impl Search {
                     }
                 }
                 2 | 3 => {
-                    if !g.dsm.is_empty() && self.rng.below(2) == 0 {
+                    if !g.branch.is_empty() && self.rng.below(6) == 0 {
+                        // Tours: try a different Lambert arc for one leg.
+                        // The local cheapest-departure pick is only a
+                        // heuristic — the full mission score, which does see
+                        // the flyby turn, the arrival v∞ and the capture
+                        // burn, decides whether the alternative survives.
+                        let i = self.rng.below(g.branch.len());
+                        g.branch[i] = if self.rng.below(3) == 0 {
+                            0 // snap back to the locally cheapest arc
+                        } else {
+                            self.rng.below(4) as u32
+                        };
+                    } else if !g.dsm.is_empty() && self.rng.below(2) == 0 {
                         // Tours: edit one leg's deep-space maneuver. Small
                         // kicks — a DSM is a course shaping burn, and the
                         // score charges every m/s of it, so the search has to
@@ -1805,6 +2035,7 @@ pub fn differential_correct(
             vinf_dep: vinf,
             thrust: Vec::new(),
             dsm: Vec::new(),
+            branch: Vec::new(),
         };
         // Correct against the *requested* target: `evaluate_direct` computes
         // its SOI and arrival Δv from `cfg.target`, so defaulting it here
@@ -2077,10 +2308,14 @@ pub struct RefinedTour {
 ///
 /// Unlike the earlier version, the patch *schedule* is not frozen: the
 /// departure epoch and leg flight times are first re-optimized on the conic
-/// model (see [`optimize_patch_epochs`]), and a leg carrying a deep-space
-/// maneuver is shot in two segments — coast to the maneuver point, then
-/// correct the post-burn velocity onto the arrival node — so the DSM Δv
-/// reported here is the one the real dynamics demand, not the conic estimate.
+/// model (see [`optimize_patch_epochs`]).
+///
+/// A leg carrying a deep-space maneuver is flown as one residual — coast from
+/// the SOI to the maneuver point, apply the genome's burn there, coast on to
+/// the node — with the *departure* velocity as the corrected variable, the
+/// same parameterization [`solve_leg`] uses. The maneuver point is therefore
+/// the one the real dynamics put the spacecraft at, and the Δv reported is
+/// the genome's burn exactly, under n-body flight.
 pub fn refine_tour(
     eph: &Ephemeris,
     cfg: &SolverConfig,
@@ -2104,6 +2339,7 @@ pub fn refine_tour(
             mu,
             states[i].vel_km_s,
             g.leg_dsm(i),
+            g.leg_branch(i),
         )?);
     }
 
@@ -2139,84 +2375,86 @@ pub fn refine_tour(
         ];
         let target_pos = states[i + 1].pos_km;
 
-        // Where the corrected segment starts, and with what seed velocity. A
-        // ballistic leg shoots from the SOI over the whole TOF; a DSM leg
-        // coasts the pre-burn segment first (its endpoint is free, so nothing
-        // to correct there) and shoots only the post-burn segment.
-        let (seg_epoch, seg_pos, seg_v0, pre) = match arcs[i].dsm {
-            None => (epochs[i], start_pos, arcs[i].v_start, None),
-            Some((t1, _, vm_req)) => {
-                let coast = dynamics::propagate_checked(
-                    eph,
-                    &leg_dyn,
-                    epochs[i],
-                    ScState { pos: start_pos, vel: arcs[i].v_start },
-                    Duration::from_seconds(t1),
-                    240,
-                    None,
-                );
-                // A pre-burn coast the integrator could not finish leaves the
-                // maneuver point undefined: the leg says nothing at all.
-                if !coast.complete {
-                    return None;
-                }
-                let (e_m, s_m) = *coast.points.last().unwrap();
-                (e_m, s_m.pos, vm_req, Some((coast.points, s_m.vel)))
-            }
-        };
-        let seg_tof = epochs[i + 1] - seg_epoch;
+        // The corrected variable is the SOI *departure* velocity, for both
+        // leg kinds — exactly as in the conic model, where the genome fixes
+        // the burn and the departure is the dependent unknown. So the whole
+        // leg (coast, burn, coast) is one residual, and the maneuver point is
+        // wherever the n-body coast from the SOI actually puts it. The old
+        // code corrected the post-burn velocity while coasting from the SOI
+        // toward a maneuver point the conic seed had propagated from the body
+        // *center* — two different points, so the refined burn could jump
+        // even when the conic one was tiny.
+        let leg_dv = arcs[i].dsm.map(|(t1, _, _)| {
+            let d = g.leg_dsm(i).copied().unwrap_or([0.0; 4]);
+            (Duration::from_seconds(t1), [d[1], d[2], d[3]])
+        });
+        let leg_tof = epochs[i + 1] - epochs[i];
 
-        // Truncation is a hard stop: a partial endpoint says nothing about
-        // where the leg arrives, so the whole correction is abandoned. The
-        // flag lets the shared Newton driver keep its plain residual signature.
-        let truncated = std::cell::Cell::new(false);
-        let shoot = |v: [f64; 3]| -> [f64; 3] {
-            let leg = dynamics::propagate_checked(
+        // Fly the whole leg for a trial departure velocity, at `samples`
+        // density: `None` if the integrator ran out of steps anywhere, since
+        // a partial endpoint says nothing about where the leg arrives.
+        let fly = |v: [f64; 3], samples: usize| -> Option<(Vec<(Epoch, ScState)>, [f64; 3])> {
+            let start = ScState { pos: start_pos, vel: v };
+            let Some((dt1, dv)) = leg_dv else {
+                let leg =
+                    dynamics::propagate_checked(eph, &leg_dyn, epochs[i], start, leg_tof, samples, None);
+                return leg.complete.then_some((leg.points, [0.0; 3]));
+            };
+            let coast =
+                dynamics::propagate_checked(eph, &leg_dyn, epochs[i], start, dt1, samples, None);
+            if !coast.complete {
+                return None;
+            }
+            let (e_m, s_m) = *coast.points.last().unwrap();
+            // The burn is the genome's vector, applied here and nowhere else.
+            let after = ScState {
+                pos: s_m.pos,
+                vel: [s_m.vel[0] + dv[0], s_m.vel[1] + dv[1], s_m.vel[2] + dv[2]],
+            };
+            let post = dynamics::propagate_checked(
                 eph,
                 &leg_dyn,
-                seg_epoch,
-                ScState { pos: seg_pos, vel: v },
-                seg_tof,
-                2,
+                e_m,
+                after,
+                epochs[i + 1] - e_m,
+                samples,
                 None,
             );
-            if !leg.complete {
-                truncated.set(true);
-                return [0.0; 3];
+            if !post.complete {
+                return None;
             }
-            sub(leg.points.last().unwrap().1.pos, target_pos)
+            let mut pts = coast.points;
+            pts.extend_from_slice(&post.points);
+            Some((pts, dv))
         };
-        let (v, miss) = newton_shoot(&shoot, seg_v0, 5, 300.0);
+
+        // Truncation is a hard stop for the whole correction. The flag lets
+        // the shared Newton driver keep its plain residual signature.
+        let truncated = std::cell::Cell::new(false);
+        let shoot = |v: [f64; 3]| -> [f64; 3] {
+            match fly(v, 2) {
+                Some((pts, _)) => sub(pts.last().unwrap().1.pos, target_pos),
+                None => {
+                    truncated.set(true);
+                    [0.0; 3]
+                }
+            }
+        };
+        let (v, miss) = newton_shoot(&shoot, arcs[i].v_start, 5, 300.0);
         if truncated.get() {
             return None;
         }
         worst_miss = worst_miss.max(miss);
 
         // Dense pass for rendering + the arrival velocity.
-        let dense = dynamics::propagate_checked(
-            eph,
-            &leg_dyn,
-            seg_epoch,
-            ScState { pos: seg_pos, vel: v },
-            seg_tof,
-            240,
-            None,
-        );
-        if !dense.complete {
-            return None;
-        }
-        match pre {
-            Some((coast, v_before)) => {
-                // The burn is whatever the corrected post-burn velocity asks
-                // for over what the coast actually delivered.
-                dsm_total += norm(sub(v, v_before));
-                traj.extend_from_slice(&coast);
-            }
-            None => {}
-        }
-        start_vels.push(arcs[i].v_start);
-        end_vels.push(dense.points.last().unwrap().1.vel);
-        traj.extend_from_slice(&dense.points);
+        let (dense, dv) = fly(v, 240)?;
+        // The burn charged is the burn flown — the genome vector itself.
+        dsm_total += norm(dv);
+        // Report the departure velocity that was actually corrected onto the
+        // node, not the conic seed it started from.
+        start_vels.push(v);
+        end_vels.push(dense.last().unwrap().1.vel);
+        traj.extend_from_slice(&dense);
     }
     // Real flyby parameters from corrected velocities.
     let mut flybys = Vec::new();
