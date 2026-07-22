@@ -20,7 +20,12 @@ use hifitime::Epoch;
 pub const MISSION_FILE: &str = "mission.orbital";
 
 /// Current on-disk format version.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// v3 adds the per-leg Lambert `branch` selector. A v1/v2 file simply omits
+/// the key, and an absent branch list means "branch 0 on every leg" — the
+/// greedy cheapest-departure arc those versions always flew — so older
+/// missions still deserialize to the trajectory they described.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Stable serialization token for a mission type — independent of `label()`.
 fn mission_token(m: MissionType) -> &'static str {
@@ -110,6 +115,15 @@ pub fn serialize(sol: &solver::Solution, cfg: &SolverConfig) -> String {
             .collect::<Vec<_>>()
             .join(",")
     );
+    s += &format!(
+        "branch={}\n",
+        sol.genome
+            .branch
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     s
 }
 
@@ -128,13 +142,15 @@ pub fn deserialize(text: &str) -> Option<(SolverConfig, solver::Genome, Epoch)> 
     let mut vinf = [0.0f64; 3];
     let mut thrust = Vec::new();
     let mut dsm = Vec::new();
+    let mut branch: Vec<u32> = Vec::new();
     let mut depart = None;
     let body = |n: &str| ALL_BODIES.iter().find(|b| b.name().eq_ignore_ascii_case(n)).copied();
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         match k {
-            // Unknown/absent version means v1; every v1 key is still read
-            // below, so nothing further is needed here.
+            // Unknown/absent version means v1. Every key of every version is
+            // still read below and the ones a older file lacks default to
+            // their pre-existing behaviour, so nothing further is needed.
             "version" => {}
             "target" => cfg.target = body(v)?,
             "mission" => cfg.mission = mission_from_token(v)?,
@@ -169,6 +185,9 @@ pub fn deserialize(text: &str) -> Option<(SolverConfig, solver::Genome, Epoch)> 
                     }
                 }
             }
+            "branch" => {
+                branch = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            }
             _ => {}
         }
     }
@@ -184,6 +203,7 @@ pub fn deserialize(text: &str) -> Option<(SolverConfig, solver::Genome, Epoch)> 
             vinf_dep: vinf,
             thrust,
             dsm,
+            branch,
         },
         depart,
     ))

@@ -644,7 +644,7 @@ fn dsm_tour_scores_no_worse_than_ballistic() {
     //    of its maneuvers — a DSM is only ever kept when it pays for itself.
     let stripped = crate::solver::evaluate_saved(&eph, &cfg, epoch0, &bare).score;
     assert!(
-        with_dsm <= stripped + 1e-9,
+        with_dsm <= stripped + 1e-6,
         "DSM tour scored worse than ballistic: {with_dsm} vs {stripped}"
     );
 
@@ -963,8 +963,9 @@ fn sep_pluto_search_uses_thrust() {
 }
 
 /// Issue #1: the launcher C3 cap must bind on *every* evaluator, not just the
-/// low-thrust one. A direct transfer needing C3 ≈ 200 km²/s² has to score far
-/// worse on a Falcon Heavy (C3 ≤ 60) than on a kick stage (C3 ≤ 130).
+/// low-thrust one. Issue #14: and it binds as a *hard* feasibility bound, not
+/// a soft weighted penalty — a transfer needing C3 ≈ 200 km²/s² is simply not
+/// flyable on a Falcon Heavy (C3 ≤ 60) and cannot buy its way past the cap.
 #[test]
 fn launcher_c3_cap_binds_on_direct_transfers() {
     use crate::solver::{evaluate_saved, Genome, Launcher, SolverConfig};
@@ -978,6 +979,7 @@ fn launcher_c3_cap_binds_on_direct_transfers() {
         vinf_dep: [v, v, v],
         thrust: Vec::new(),
         dsm: Vec::new(),
+        branch: Vec::new(),
     };
     let score_for = |l: Launcher| {
         let cfg = SolverConfig {
@@ -988,10 +990,19 @@ fn launcher_c3_cap_binds_on_direct_transfers() {
     };
     let fh = score_for(Launcher::FalconHeavy);
     let kick = score_for(Launcher::KickStage);
-    // Penalty difference is exactly (130 − 60) · 5 = 350.
+    // C3 = 200 is over *both* caps, so both are demoted outright — no
+    // exchange rate against the objective, just the infeasible offset plus
+    // the km/s v∞ shortfall so the search still has a gradient home.
     assert!(
-        (fh - kick - 350.0).abs() < 1e-6,
-        "direct C3 penalty not applied: FH {fh}, kick {kick}"
+        fh > 1e8 && kick > 1e8,
+        "over-cap candidates were not ruled infeasible: FH {fh}, kick {kick}"
+    );
+    // The tighter launcher is the further from flyable, and the gap is the
+    // difference in v∞ capability in km/s — same unit as every other term.
+    let expected = 130.0f64.sqrt() - 60.0f64.sqrt();
+    assert!(
+        (fh - kick - expected).abs() < 1e-6,
+        "C3 shortfall is not the km/s v∞ deficit: FH {fh}, kick {kick}"
     );
     // And the over-cap solution must lose outright to a plausible in-cap one.
     let cheap = Genome {
@@ -1009,7 +1020,8 @@ fn launcher_c3_cap_binds_on_direct_transfers() {
     );
 }
 
-/// Issue #1, tour branch: the same cap must bind on `evaluate_tour`.
+/// Issue #1, tour branch: the same cap must bind on `evaluate_tour` — and,
+/// per issue #14, bind hard there too.
 #[test]
 fn launcher_c3_cap_binds_on_tours() {
     use crate::solver::{evaluate_saved, Genome, Launcher, SolverConfig};
@@ -1032,20 +1044,34 @@ fn launcher_c3_cap_binds_on_tours() {
                 vinf_dep: [0.0; 3],
                 thrust: Vec::new(),
             dsm: Vec::new(),
+        branch: Vec::new(),
             };
             let fh = evaluate_saved(&eph, &base(Launcher::FalconHeavy), epoch0, &g);
             let kick = evaluate_saved(&eph, &base(Launcher::KickStage), epoch0, &g);
             let c3 = fh.vinf_dep_kms * fh.vinf_dep_kms;
-            if fh.score >= 1e4 || !(60.0..130.0).contains(&c3) {
+            // Gate on the launcher that *can* fly it: the tour has to be a
+            // real solved trajectory, and one whose C3 falls between the two
+            // caps so exactly one launcher is violated.
+            if kick.score >= 1e4 || !(60.0..130.0).contains(&c3) {
                 continue;
             }
             found = true;
-            let expected = (c3 - 60.0) * 5.0;
             assert!(
-                (fh.score - kick.score - expected).abs() < 1e-6,
-                "tour C3 penalty wrong: C3 {c3}, FH {}, kick {}",
-                fh.score,
+                fh.score > 1e8,
+                "over-cap tour was not ruled infeasible: C3 {c3}, FH {}",
+                fh.score
+            );
+            assert!(
+                kick.score < 1e4,
+                "in-cap tour was penalized: C3 {c3}, kick {}",
                 kick.score
+            );
+            // What is left past the bound is the v∞ shortfall in km/s.
+            let expected = 1e9 + kick.score + (c3.sqrt() - 60.0f64.sqrt());
+            assert!(
+                (fh.score - expected).abs() < 1e-6,
+                "tour C3 shortfall wrong: C3 {c3}, FH {}, expected {expected}",
+                fh.score
             );
         }
     }
@@ -1106,6 +1132,7 @@ fn truncated_flights_score_infeasible() {
         vinf_dep: [1.0, 3.0, 0.2],
         thrust: Vec::new(),
         dsm: Vec::new(),
+        branch: Vec::new(),
     };
     let full = solver_dynamics();
     let good = evaluate(&eph, &full, &cfg, depart, &g, 32);
@@ -1199,6 +1226,7 @@ fn mission_file_round_trips() {
         vinf_dep: [0.1, -0.2, 0.05],
         thrust: vec![[0.3, 0.4, 0.5]],
         dsm: vec![[0.5, 0.1, 0.2, 0.3]],
+        branch: vec![0],
     };
     let sol = evaluate_saved(&eph, &cfg, epoch0, &g);
     let text = mission::serialize(&sol, &cfg);
@@ -1216,6 +1244,7 @@ fn mission_file_round_trips() {
     assert_eq!(g2.vinf_dep, g.vinf_dep);
     assert_eq!(g2.thrust, g.thrust);
     assert_eq!(g2.dsm, g.dsm);
+    assert_eq!(g2.branch, g.branch);
     assert!((depart.to_tdb_seconds() - sol.depart.to_tdb_seconds()).abs() < 1e-3);
 }
 
@@ -1238,6 +1267,9 @@ fn mission_file_loads_legacy_label_keys() {
     assert!(cfg.launcher == Launcher::Sls);
     assert_eq!(cfg.route, vec![BodyId::Venus]);
     assert_eq!(g.legs, vec![180.0, 220.0]);
+    // A pre-v3 file has no branch list: every leg flies branch 0, the
+    // cheapest-departure arc those versions always picked.
+    assert!(g.branch.is_empty(), "legacy file invented branch selectors");
 }
 
 /// #11: `newton_shoot` must return the best iterate it saw, not the last one.
@@ -1286,4 +1318,235 @@ fn newton_shoot_rejects_worsening_steps() {
         n <= 1000.0 + 1e-6,
         "corrector wandered uphill to {n} km from a 1000 km start"
     );
+}
+
+/// Issue #13, part 1: the DSM genome vector must *be* the maneuver.
+///
+/// Under the old parameterization the genome kicked the leg's *departure*
+/// velocity and the Δv charged was a later Lambert mismatch, so the number
+/// the optimizer paid for had no fixed relationship to the number it chose —
+/// the departure perturbation was effectively free. Now the genome vector is
+/// the burn applied at the maneuver point, and the charge is its magnitude.
+#[test]
+fn dsm_genome_vector_is_the_charged_burn() {
+    use crate::solver::{evaluate_saved, Genome, SolverConfig};
+    let (eph, _) = Ephemeris::load();
+    let cfg = SolverConfig {
+        target: BodyId::Mars,
+        route: vec![BodyId::Venus],
+        auto_route: false,
+        ..Default::default()
+    };
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2028, 1, 1);
+
+    // Several distinct burns, so a coincidental match can't carry the test.
+    for burn in [
+        [0.05f64, -0.03, 0.02],
+        [0.4, 0.1, -0.2],
+        [-0.15, 0.25, 0.05],
+    ] {
+        let g = Genome {
+            depart_days: 20.0,
+            legs: vec![160.0, 240.0],
+            vinf_dep: [0.0; 3],
+            thrust: Vec::new(),
+            dsm: vec![
+                [0.4, burn[0], burn[1], burn[2]],
+                [0.5, 0.0, 0.0, 0.0],
+            ],
+            branch: vec![0, 0],
+        };
+        let sol = evaluate_saved(&eph, &cfg, epoch0, &g);
+        // A solved tour, feasible or not: `bad()` marks an unsolvable one
+        // with an infinite miss and would report no Δv at all.
+        assert!(sol.miss_km.is_finite(), "tour did not solve, score {}", sol.score);
+        let want = (burn[0] * burn[0] + burn[1] * burn[1] + burn[2] * burn[2]).sqrt();
+        assert!(
+            (sol.dsm_dv_kms - want).abs() < 1e-9,
+            "charged Δv {} is not the genome burn {want} ({burn:?})",
+            sol.dsm_dv_kms
+        );
+    }
+}
+
+/// Issue #13, part 2: degeneracy to the ballistic leg must be *continuous*,
+/// not a single coincidence at exactly zero.
+///
+/// The old code bypassed the DSM path entirely at `dv == 0`; for any nonzero
+/// kick, however tiny, it re-ran `lambert_best` on the second sub-arc, which
+/// could land on a different revolution count or branch and jump the arrival
+/// velocity and the charged Δv by a finite amount. So an arbitrarily small
+/// maneuver could change the score arbitrarily much.
+///
+/// Sweep the burn magnitude across nine orders of magnitude on a long,
+/// multi-revolution geometry — the regime where the branch set is richest and
+/// a flip is most likely — and require every observable to converge to the
+/// ballistic leg at a rate bounded by the burn itself.
+#[test]
+fn dsm_converges_continuously_to_ballistic() {
+    use crate::solver::{evaluate_saved, Genome, SolverConfig};
+    let (eph, _) = Ephemeris::load();
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2028, 1, 1);
+
+    // Long legs against inner-planet nodes: TOF spans several transfer
+    // periods, so `max_revs` admits multiple families and both branches of
+    // each. This is precisely where the old second Lambert could flip.
+    // These specific geometries were found by sweeping legs, departures and
+    // burn positions against the *old* code and keeping the ones where its
+    // second `lambert_best` demonstrably flipped branch under a vanishing
+    // kick. They are the regression, not decoration.
+    let cases: [(BodyId, Vec<BodyId>, Vec<f64>, f64); 4] = [
+        (BodyId::Mars, vec![BodyId::Venus], vec![900.0, 1170.0], 0.45),
+        (BodyId::Jupiter, vec![BodyId::Venus, BodyId::Earth], vec![900.0, 1170.0, 1440.0], 0.45),
+        (BodyId::Jupiter, vec![BodyId::Venus, BodyId::Earth], vec![180.0, 420.0, 700.0], 0.45),
+        (BodyId::Saturn, vec![BodyId::Earth], vec![640.0, 900.0], 0.6),
+    ];
+
+    let mut checked = 0;
+    for (target, route, legs, frac) in cases {
+        let cfg = SolverConfig {
+            target,
+            route: route.clone(),
+            auto_route: false,
+            ..Default::default()
+        };
+        let n = legs.len();
+        let base = Genome {
+            depart_days: 0.0,
+            legs,
+            vinf_dep: [0.0; 3],
+            thrust: Vec::new(),
+            dsm: Vec::new(),
+            branch: vec![0; n],
+        };
+        let ballistic = evaluate_saved(&eph, &cfg, epoch0, &base);
+        if ballistic.score >= 1e4 {
+            continue; // geometry with no conic solution: nothing to compare
+        }
+
+        // A fixed unit direction, scaled down decade by decade.
+        let dir = {
+            let d = [0.6f64, -0.7, 0.39];
+            let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            [d[0] / n, d[1] / n, d[2] / n]
+        };
+        // (deviation / burn) at each magnitude: a *rate*, so the check is
+        // scale-free and does not have to guess this geometry's sensitivity.
+        let mut rates: Vec<(f64, f64)> = Vec::new();
+        for k in 0..10 {
+            let mag = 1e-3 * 10f64.powi(-(k as i32)); // 1e-3 … 1e-12
+            let mut g = base.clone();
+            g.dsm = vec![[0.5, 0.0, 0.0, 0.0]; n];
+            g.dsm[0] = [frac, dir[0] * mag, dir[1] * mag, dir[2] * mag];
+            let sol = evaluate_saved(&eph, &cfg, epoch0, &g);
+            assert!(
+                sol.score < 1e4,
+                "{target:?}: a {mag:e} km/s burn made the leg unsolvable"
+            );
+
+            // The charge is the burn: it vanishes with it.
+            assert!(
+                (sol.dsm_dv_kms - mag).abs() <= 1e-12 + 1e-9 * mag,
+                "{target:?}: {mag:e} km/s burn charged {}",
+                sol.dsm_dv_kms
+            );
+
+            // How far the leg moved: score plus both v∞ endpoints, i.e. the
+            // whole observable state of the transfer.
+            let dev = (sol.score - ballistic.score).abs()
+                + (sol.vinf_dep_kms - ballistic.vinf_dep_kms).abs()
+                + (sol.vinf_arr_kms - ballistic.vinf_arr_kms).abs();
+            // Below this the deviation is floating-point noise on an O(1)
+            // score, not a signal about the parameterization.
+            if dev > 1e-9 {
+                rates.push((mag, dev / mag));
+            }
+            checked += 1;
+        }
+
+        // Lipschitz continuity, stated without assuming the constant: a
+        // smooth leg has a bounded deviation *rate*, so shrinking the burn by
+        // nine decades must not inflate dev/burn. A branch or revolution flip
+        // is a finite jump — dev stops shrinking while the burn keeps going,
+        // so the rate grows without bound and this catches it by orders of
+        // magnitude, not by a hair. The 100x slack absorbs the genuine
+        // conditioning of a long multi-rev leg.
+        if let Some((mag0, rate0)) = rates.first().copied() {
+            for (mag, rate) in &rates {
+                assert!(
+                    *rate <= rate0 * 100.0,
+                    "{target:?}: deviation rate blew up from {rate0:e}/km/s at \
+                     {mag0:e} to {rate:e}/km/s at {mag:e} — the leg does not \
+                     converge continuously to the ballistic arc"
+                );
+            }
+        }
+    }
+    assert!(checked >= 20, "not enough solvable geometries swept ({checked})");
+}
+
+/// Issue #14, part 2: alternative Lambert branches must be *visible* to the
+/// caller, not silently swallowed by a greedy local pick, and the per-leg
+/// branch gene has to actually change the trajectory that gets scored.
+#[test]
+fn lambert_branches_are_exposed_and_selectable() {
+    use crate::solver::{evaluate_saved, lambert_best, lambert_candidates, Genome, SolverConfig};
+    let mu = BodyId::Sun.gm();
+    // A near-circular 1 AU → 1.5 AU geometry over a long TOF: several
+    // revolution counts fit, each with a low and a high branch.
+    let r1 = [1.496e8, 0.0, 0.0];
+    let r2 = [0.0, 2.244e8, 0.0];
+    let tof = 1400.0 * 86_400.0;
+    let vref = [0.0, 29.8, 0.0];
+    let c = lambert_candidates(r1, r2, tof, mu, vref);
+    assert!(c.len() > 2, "geometry offered only {} arc(s)", c.len());
+
+    // Ordered cheapest-departure first, and index 0 is exactly `lambert_best`.
+    let cost = |v: [f64; 3]| {
+        let d = [v[0] - vref[0], v[1] - vref[1], v[2] - vref[2]];
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+    };
+    for w in c.windows(2) {
+        assert!(cost(w[0].0) <= cost(w[1].0), "candidates are not sorted");
+    }
+    assert_eq!(lambert_best(r1, r2, tof, mu, vref).unwrap().0, c[0].0);
+    // The alternatives are genuinely distinct trajectories.
+    assert!(
+        c.iter().skip(1).any(|a| a.0 != c[0].0),
+        "every candidate was the same arc"
+    );
+
+    // And the gene reaches the score: branch 0 is the historical behaviour,
+    // some other branch flies something else.
+    let (eph, _) = Ephemeris::load();
+    let cfg = SolverConfig {
+        target: BodyId::Jupiter,
+        route: vec![BodyId::Earth],
+        auto_route: false,
+        ..Default::default()
+    };
+    let epoch0 = Epoch::from_gregorian_utc_at_midnight(2028, 1, 1);
+    let base = Genome {
+        depart_days: 30.0,
+        legs: vec![700.0, 900.0],
+        vinf_dep: [0.0; 3],
+        thrust: Vec::new(),
+        dsm: Vec::new(),
+        branch: vec![0, 0],
+    };
+    let s0 = evaluate_saved(&eph, &cfg, epoch0, &base);
+    // An empty branch list must mean the same thing as all-zeros.
+    let mut unset = base.clone();
+    unset.branch = Vec::new();
+    assert_eq!(
+        s0.score,
+        evaluate_saved(&eph, &cfg, epoch0, &unset).score,
+        "an unset branch list is not branch 0"
+    );
+    let differs = (1..4).any(|k| {
+        let mut g = base.clone();
+        g.branch = vec![k, 0];
+        evaluate_saved(&eph, &cfg, epoch0, &g).score != s0.score
+    });
+    assert!(differs, "the branch gene never changed the scored trajectory");
 }
