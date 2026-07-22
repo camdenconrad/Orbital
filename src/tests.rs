@@ -1239,3 +1239,51 @@ fn mission_file_loads_legacy_label_keys() {
     assert_eq!(cfg.route, vec![BodyId::Venus]);
     assert_eq!(g.legs, vec![180.0, 220.0]);
 }
+
+/// #11: `newton_shoot` must return the best iterate it saw, not the last one.
+///
+/// The residual here is deliberately non-monotone in the way an n-body arc is:
+/// it drops to a good value and then, once the walk passes a threshold, jumps
+/// back up. A corrector that returns its final iterate reports the bad value;
+/// one that keeps the best reports the good one.
+#[test]
+fn newton_shoot_keeps_best_iterate() {
+    // The residual walks *through* its optimum: Newton converges toward x=0.5,
+    // but every evaluation past x=0.45 returns a large value — a stand-in for
+    // the Lambert branch flip a tour leg walks into just as it closes in. An
+    // unguarded corrector accepts that step and reports the post-flip residual;
+    // one that backtracks refuses it and reports the good iterate it already had.
+    let shoot = |v: [f64; 3]| -> [f64; 3] {
+        if v[0] > 0.45 {
+            return [8000.0, 0.0, 0.0];
+        }
+        [(v[0] - 0.5) * 1000.0, v[1] * 1000.0, v[2] * 1000.0]
+    };
+    let (best_v, best_norm) = super::solver::newton_shoot(&shoot, [0.0, 0.0, 0.0], 20, 1.0);
+    assert!(
+        best_norm < 500.0,
+        "corrector returned {best_norm} km; it should keep the best iterate it found"
+    );
+    // And the returned vector must be the one that produced that residual.
+    let f = shoot(best_v);
+    let n = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+    assert!(
+        (n - best_norm).abs() < 1.0,
+        "returned vector residual {n} km disagrees with reported {best_norm} km"
+    );
+}
+
+/// #11: a step that makes the residual worse must be rejected, not accepted.
+#[test]
+fn newton_shoot_rejects_worsening_steps() {
+    let shoot = |v: [f64; 3]| -> [f64; 3] {
+        // Flat gradient in x with a large constant offset: Newton wants a huge
+        // step, but every trial point is worse than the start.
+        [1000.0 + v[0].abs() * 1e6, v[1] * 1e-9, v[2] * 1e-9]
+    };
+    let (_, n) = super::solver::newton_shoot(&shoot, [0.0, 0.0, 0.0], 20, 1.0);
+    assert!(
+        n <= 1000.0 + 1e-6,
+        "corrector wandered uphill to {n} km from a 1000 km start"
+    );
+}

@@ -1839,7 +1839,15 @@ pub fn differential_correct(
 /// Damped Newton on a 3-vector residual with a finite-difference Jacobian.
 /// Shared by every shooting stage; returns the corrected vector and the final
 /// residual norm. Deterministic: fixed iteration count and step order.
-fn newton_shoot(
+///
+/// Like `differential_correct`, this backtracks and returns the *best* iterate
+/// rather than the last one. The reason is the same and applies with more force
+/// here: `refine_tour` shoots n-body arcs, so the residual carries the adaptive
+/// integrator's ~1e3 km step-sequence jitter, and a late iterate can be far
+/// worse than an early one. Tour legs additionally sit on Lambert branch
+/// boundaries, where the residual is genuinely discontinuous and an unguarded
+/// full step can jump to a different transfer family entirely.
+pub(crate) fn newton_shoot(
     shoot: &dyn Fn([f64; 3]) -> [f64; 3],
     v0: [f64; 3],
     iters: usize,
@@ -1848,11 +1856,14 @@ fn newton_shoot(
     let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     let mut v = v0;
     let mut f = shoot(v);
+    let (mut best_v, mut best_norm) = (v, norm(f));
     for _ in 0..iters {
-        if norm(f) < tol_km {
+        if best_norm < tol_km {
             break;
         }
-        const H: f64 = 1e-4;
+        // H must clear the integrator jitter or the Jacobian is mostly noise —
+        // see the sizing argument in `differential_correct`.
+        const H: f64 = 1e-3;
         let mut jac = [[0.0f64; 3]; 3];
         for c in 0..3 {
             let mut vp = v;
@@ -1882,13 +1893,32 @@ fn newton_shoot(
         let dv = [solve_col(0), solve_col(1), solve_col(2)];
         // Damp absurd steps (near-singular geometry).
         let dvn = norm(dv);
-        let scale = if dvn > 1.0 { 1.0 / dvn } else { 1.0 };
-        for c in 0..3 {
-            v[c] += dv[c] * scale;
+        let mut scale = if dvn > 1.0 { 1.0 / dvn } else { 1.0 };
+        // Backtracking line search: halve until the step actually improves.
+        let mut stepped = false;
+        for _ in 0..6 {
+            let mut trial = v;
+            for c in 0..3 {
+                trial[c] += dv[c] * scale;
+            }
+            let ft = shoot(trial);
+            if norm(ft) < norm(f) {
+                v = trial;
+                f = ft;
+                stepped = true;
+                break;
+            }
+            scale *= 0.5;
         }
-        f = shoot(v);
+        if !stepped {
+            break; // no improving step along this direction; best_* holds the answer
+        }
+        if norm(f) < best_norm {
+            best_norm = norm(f);
+            best_v = v;
+        }
     }
-    (v, norm(f))
+    (best_v, best_norm)
 }
 
 /// Coordinate descent on the patch *schedule*: nudge the departure epoch and
