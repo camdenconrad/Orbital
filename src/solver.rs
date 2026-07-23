@@ -262,17 +262,35 @@ pub(crate) fn min_flyby_periapsis_km(b: BodyId) -> f64 {
     }
 }
 
-/// Δv charged at the target for the chosen mission type, km/s.
+/// Finite-burn (gravity + steering) loss factor on a large impulsive burn.
+///
+/// A real capture or landing burn is not impulsive: it arcs over finite time,
+/// so part of the thrust fights gravity and points off the velocity vector,
+/// and the achieved Δv falls short of the impulsive ideal. The loss grows with
+/// burn size (a bigger Δv is a longer arc). Modeled as a fraction rising with
+/// the burn magnitude, clamped to the 3–15% band real chemical captures see.
+/// This is an engineering margin, not a derived arc integral — but charging it
+/// stops the optimizer preferring high-v∞ arrivals that are cheaper only
+/// because the loss was omitted.
+fn finite_burn_loss(dv_kms: f64) -> f64 {
+    let frac = (0.05 * dv_kms).clamp(0.03, 0.15);
+    dv_kms * (1.0 + frac)
+}
+
+/// Statistical trajectory-correction-maneuver (TCM) allocation, as a fraction
+/// of the deterministic post-launch Δv. Real interplanetary missions budget
+/// ~1–2% for cruise navigation (injection-error cleanup, approach targeting).
+/// Charged so the reported budget reflects it and the optimizer mildly favors
+/// lower-Δv missions, whose statistical corrections are also smaller.
+const TCM_FRACTION: f64 = 0.02;
+
+/// Δv charged at the target for the chosen mission type, km/s. Propulsive
+/// burns carry the finite-burn margin (see [`finite_burn_loss`]).
 pub fn arrival_dv_kms(body: BodyId, vinf_kms: f64, mission: MissionType) -> f64 {
     let mu = body.gm();
     match mission {
         MissionType::Flyby => 0.0,
-        MissionType::Orbit => {
-            let rp = 1.5 * body.radius_km();
-            let vp_hyp = (vinf_kms * vinf_kms + 2.0 * mu / rp).sqrt();
-            let vp_ell = (mu / rp * (1.0 + 0.95)).sqrt();
-            vp_hyp - vp_ell
-        }
+        MissionType::Orbit => finite_burn_loss(orbit_insertion_dv(body, vinf_kms, 1.5 * body.radius_km())),
         MissionType::Land => {
             if is_gas_giant(body) {
                 return 1e3; // no surface to land on
@@ -282,10 +300,20 @@ pub fn arrival_dv_kms(body: BodyId, vinf_kms: f64, mission: MissionType) -> f64 
             } else {
                 // Propulsive soft landing from the arrival hyperbola.
                 let r = body.radius_km();
-                (vinf_kms * vinf_kms + 2.0 * mu / r).sqrt()
+                finite_burn_loss((vinf_kms * vinf_kms + 2.0 * mu / r).sqrt())
             }
         }
     }
+}
+
+/// Impulsive orbit-insertion Δv: brake from the arrival hyperbola at periapsis
+/// `rp` into the parked ellipse (e = 0.95). The finite-burn margin is applied
+/// by the caller so this stays a clean two-body quantity.
+fn orbit_insertion_dv(body: BodyId, vinf_kms: f64, rp: f64) -> f64 {
+    let mu = body.gm();
+    let vp_hyp = (vinf_kms * vinf_kms + 2.0 * mu / rp).sqrt();
+    let vp_ell = (mu / rp * (1.0 + 0.95)).sqrt();
+    vp_hyp - vp_ell
 }
 
 #[derive(Clone)]
@@ -1402,13 +1430,15 @@ fn evaluate_tour(
     let total_tof = g.total_tof_days();
     let arrival_dv = arrival_dv_kms(cfg.target, vinf_arr, cfg.mission);
     // DSM Δv is real propellant, charged exactly like powered-flyby Δv.
+    // Cruise nav allocation on the deterministic post-launch Δv (#18).
+    let tcm = TCM_FRACTION * (arrival_dv + assist_dv + dsm_dv);
     let score = mission_score(
         cfg,
         vinf_dep,
         g.vinf_dep,
         arrival_dv,
         total_tof,
-        assist_dv + dsm_dv,
+        assist_dv + dsm_dv + tcm,
         0.0,
     );
 
@@ -1540,13 +1570,16 @@ fn evaluate_direct(
     // at the SOI boundary.
     let excess = (miss_km - soi_km(eph, cfg.target, arrive)).max(0.0);
     let arrival_dv = arrival_dv_kms(cfg.target, vinf_arr, cfg.mission);
+    // Cruise nav allocation on the deterministic post-launch Δv (#18); for a
+    // direct transfer that is the arrival burn.
+    let tcm = TCM_FRACTION * arrival_dv;
     let score = mission_score(
         cfg,
         vinf_dep,
         g.vinf_dep,
         arrival_dv,
         g.legs[0],
-        excess * 1e-6 + miss_km * 3e-8,
+        excess * 1e-6 + miss_km * 3e-8 + tcm,
         0.0,
     );
 
@@ -2457,13 +2490,12 @@ pub fn correct_direct(
             let rp = hyp2.rp_km;
             out.periapsis_alt_km = Some(rp - target.radius_km());
             out.vinf_arr_kms = Some(hyp2.vinf_kms);
-            // Same insertion model as `arrival_dv_kms`, at the real periapsis.
+            // Same insertion model as `arrival_dv_kms`, at the real periapsis,
+            // carrying the same finite-burn margin (#18).
             out.arrival_dv_kms = Some(match mission {
                 MissionType::Flyby => 0.0,
                 MissionType::Orbit => {
-                    let vp_hyp = (hyp2.vinf_kms.powi(2) + 2.0 * mu / rp).sqrt();
-                    let vp_ell = (mu / rp * (1.0 + 0.95)).sqrt();
-                    vp_hyp - vp_ell
+                    finite_burn_loss(orbit_insertion_dv(target, hyp2.vinf_kms, rp))
                 }
                 MissionType::Land => arrival_dv_kms(target, hyp2.vinf_kms, mission),
             });

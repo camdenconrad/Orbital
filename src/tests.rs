@@ -789,6 +789,32 @@ fn veega_tour_search_is_sane() {
     }
 }
 
+/// Issue #18: capture Δv must carry a finite-burn margin that grows with burn
+/// size, so a high-v∞ arrival is charged more than the impulsive ideal and
+/// isn't preferred only because the loss was omitted.
+#[test]
+fn capture_dv_carries_finite_burn_margin() {
+    use crate::solver::{arrival_dv_kms, MissionType};
+    // Impulsive ideal for a Mars orbit capture (1.5 R, e=0.95), by hand.
+    let mu = BodyId::Mars.gm();
+    let rp = 1.5 * BodyId::Mars.radius_km();
+    let vinf = 2.6;
+    let ideal = (vinf * vinf + 2.0 * mu / rp).sqrt() - (mu / rp * 1.95).sqrt();
+    let charged = arrival_dv_kms(BodyId::Mars, vinf, MissionType::Orbit);
+    // Charged strictly more than ideal, within the 3–15% margin band.
+    assert!(charged > ideal * 1.03 - 1e-9, "no margin: {charged} vs {ideal}");
+    assert!(charged < ideal * 1.16, "margin too large: {charged} vs {ideal}");
+    // The margin fraction grows with burn size: a fast (high-v∞) arrival is
+    // charged a larger *fraction* than a gentle one.
+    let gentle = 1.0;
+    let fast = 5.0;
+    let frac = |vinf: f64| {
+        let ideal = (vinf * vinf + 2.0 * mu / rp).sqrt() - (mu / rp * 1.95).sqrt();
+        arrival_dv_kms(BodyId::Mars, vinf, MissionType::Orbit) / ideal - 1.0
+    };
+    assert!(frac(fast) > frac(gentle), "margin not monotone in burn size");
+}
+
 /// Issue #17: a high-declination launch asymptote must derate the usable C3,
 /// while an in-plane (low-DLA) departure keeps the full cap. The derate only
 /// bites trajectories pushing near the launcher's capability.

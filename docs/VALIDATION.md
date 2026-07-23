@@ -80,10 +80,20 @@ trajectories — the validated low-C3 Mars/VEEGA solutions sit far under the cap
 and are unchanged (Mars 2020 still rediscovers at 2020-07-30, C3 14.4).
 
 **Mission types.** The arrival cost is mission-dependent: *flyby* (v∞ free),
-*orbit* (capture at 1.5 radii into an e = 0.95 ellipse — gives 1.01 km/s JOI
-above, vs ~0.6-0.9 km/s for real JOI into wider orbits), *land* (propulsive
-descent for airless bodies, ~free aerodynamic entry for Venus/Earth/Mars/
-Titan, unavailable for gas giants).
+*orbit* (capture at 1.5 radii into an e = 0.95 ellipse — gives ~1.06 km/s JOI
+above after margin, vs ~0.6-0.9 km/s for real JOI into wider orbits), *land*
+(propulsive descent for airless bodies, ~free aerodynamic entry for Venus/
+Earth/Mars/Titan, unavailable for gas giants).
+
+**Δv margins.** Propulsive arrival burns carry a finite-burn (gravity +
+steering) margin rising with burn size across a 3–15% band, since a real
+capture burn arcs over finite time rather than firing impulsively. Ballistic
+missions additionally carry a 2% statistical TCM allocation on the
+deterministic post-launch Δv for cruise navigation. Both are engineering
+margins with cited real-world ranges, not derived arc integrals; they are
+charged so the optimizer stops preferring high-v∞ arrivals that look cheap
+only because the losses were omitted. The validated windows are unchanged
+(Mars 2020 still rediscovers at 2020-07-30 within the 1% C3 tolerance).
 
 **Multi-leg shooting (tours).** Accepting a tour launches background
 multiple shooting: each Lambert leg is differentially corrected under the
