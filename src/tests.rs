@@ -952,6 +952,19 @@ fn tour_refines_to_mission_grade() {
     );
     assert_eq!(rt.flybys.len(), 1);
     assert!(rt.traj.len() > 400, "dense trajectory expected");
+    // Issue #16: the final leg is B-plane-targeted onto the mission periapsis,
+    // the same fidelity a direct transfer gets — a real captured periapsis and
+    // a real insertion Δv, not the idealized center-targeted 1.5·R capture.
+    let berr = rt.arrival_bplane_err_km.expect("arrival B-plane targeted");
+    assert!(berr < 50.0, "arrival B-plane error {berr:.1} km");
+    let alt = rt.arrival_periapsis_alt_km.expect("arrival periapsis");
+    let want = 0.5 * BodyId::Mars.radius_km(); // 1.5 R orbit ⇒ 0.5 R altitude
+    assert!(
+        (alt - want).abs() < 50.0,
+        "arrival periapsis alt {alt:.0} km, wanted ~{want:.0}"
+    );
+    let dv = rt.arrival_dv_kms.expect("arrival insertion Δv");
+    assert!(dv > 0.3 && dv < 5.0, "arrival insertion Δv {dv:.2} km/s");
 }
 
 /// GPU porkchop must run headless without tripping wgpu validation (a shader

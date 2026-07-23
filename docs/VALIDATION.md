@@ -107,12 +107,25 @@ only because the losses were omitted. The validated windows are unchanged
 (Mars 2020 still rediscovers at 2020-07-30 within the 1% C3 tolerance).
 
 **Multi-leg shooting (tours).** Accepting a tour launches background
-multiple shooting: each Lambert leg is differentially corrected under the
-full n-body dynamics (arrival body excluded per leg — its SOI hyperbola is
-the flyby model's domain) until it hits its patch body at the patch epoch to
-km-scale; flyby v∞/altitude are then recomputed from the corrected
-velocities and the continuous n-body path replaces the conic sketch
-(`tour_refines_to_mission_grade`).
+multiple shooting. Each intermediate Lambert leg is differentially corrected
+under the full n-body dynamics — with its flyby body excluded from that leg,
+because the assist is modeled as a *linked-conic* velocity turn at the body
+centre whose bending is held to a safe periapsis (`min_flyby_periapsis_km`:
+atmospheric bodies cleared +200 km, gas giants 1.5 R, airless a low non-graze)
+and charged as powered-flyby Δv beyond that limit — until it hits its patch
+body at the patch epoch to km-scale. Flyby v∞/altitude are recomputed from the
+corrected velocities and the continuous n-body path replaces the conic sketch
+(`tour_refines_to_mission_grade`, `veega_tour_search_is_sane`).
+
+The *final* leg to the target is treated to full arrival fidelity — the same
+as a direct transfer: it includes the target's gravity and is B-plane-targeted
+onto the mission periapsis, so the arrival arc flies to a real captured
+periapsis (Venus→Mars tour: 1695 km altitude = the 1.5 R orbit, B-plane error
+< 1 km) and the insertion Δv is computed there rather than from the idealized
+capture. The mission-critical orbit insertion is thus mission-grade; the
+intermediate gravity assists remain linked-conic (preliminary-design fidelity)
+— full-integrated flyby passages, where each assist periapsis becomes a
+directly controlled B-plane variable, are a tracked follow-up.
 
 **Two-phase refinement.** Accepted direct transfers are polished by a
 Newton differential corrector (finite-difference Jacobian on v∞, full-

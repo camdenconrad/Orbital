@@ -1329,6 +1329,11 @@ impl eframe::App for App {
                         sol.genome = rt.genome.clone();
                         sol.depart = rt.epochs[0];
                         sol.arrive = *rt.epochs.last().unwrap();
+                        // B-plane-targeted arrival supersedes the scout's
+                        // idealized capture Δv when the final leg converged.
+                        if let Some(dv) = rt.arrival_dv_kms {
+                            sol.arrival_dv_kms = dv;
+                        }
                     }
                     let mut info = format!(
                         "n-body tour: v∞ dep {:.2} arr {:.2} · assist Δv {:.2} km/s",
@@ -1336,6 +1341,13 @@ impl eframe::App for App {
                     );
                     if rt.dsm_dv_kms > 0.001 {
                         info += &format!(" · DSM Δv {:.2} km/s", rt.dsm_dv_kms);
+                    }
+                    if let (Some(alt), Some(berr)) =
+                        (rt.arrival_periapsis_alt_km, rt.arrival_bplane_err_km)
+                    {
+                        info += &format!(
+                            "\narrival: periapsis {alt:.0} km alt · B-plane to {berr:.1} km"
+                        );
                     }
                     for f in &rt.flybys {
                         let (y, mo, d, ..) = f.epoch.to_gregorian_utc();

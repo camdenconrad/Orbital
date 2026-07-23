@@ -2340,6 +2340,92 @@ fn hyperbola_at(mu: f64, r: [f64; 3], v: [f64; 3]) -> Option<Hyperbola> {
     })
 }
 
+/// Retarget a control velocity in the B-plane so the target-relative arrival
+/// hyperbola reaches periapsis radius `rp_des`, holding the approach plane
+/// fixed at the incoming solution.
+///
+/// `rel` maps a candidate control (an SOI-departure velocity) to the arrival
+/// state relative to the target `(r, v)`. `v1` must already deliver the arc
+/// into the target's SOI on a hyperbola — it's the coarse "hit the center"
+/// solution whose only job is to get inside, where the B-plane map is smooth
+/// (see the fold argument on `correct_direct`). The B-plane frame and the
+/// desired B-vector are frozen at `v1`'s hyperbola so the Newton goalposts
+/// don't move with the walk. Returns the corrected control, the achieved
+/// arrival hyperbola, and the B-plane residual in km. Shared by the direct
+/// corrector and the tour arrival so both target arrival identically.
+fn bplane_retarget(
+    mu: f64,
+    rp_des: f64,
+    rel: &dyn Fn([f64; 3]) -> Option<([f64; 3], [f64; 3])>,
+    v1: [f64; 3],
+) -> Option<([f64; 3], Hyperbola, f64)> {
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let (r1, vr1) = rel(v1)?;
+    let hyp1 = hyperbola_at(mu, r1, vr1)?;
+    // Frozen B-plane frame from the incoming asymptote: T̂ ⟂ the reference
+    // pole, R̂ completing the triad.
+    let s0_hat = hyp1.s_hat;
+    let t_raw = cross(s0_hat, [0.0, 0.0, 1.0]);
+    let tn = dot(t_raw, t_raw).sqrt();
+    if tn < 1e-9 {
+        return None; // asymptote along the pole; degenerate frame
+    }
+    let t_hat = [t_raw[0] / tn, t_raw[1] / tn, t_raw[2] / tn];
+    let r_hat = cross(s0_hat, t_hat);
+    // Desired |B| for `rp_des` at the incoming v∞: b = rp·√(1 + 2μ/(rp·v∞²)),
+    // along the incoming approach plane (B̂ from the incoming hyperbola).
+    let vinf_ref = hyp1.vinf_kms;
+    let b_des_mag = rp_des * (1.0 + 2.0 * mu / (rp_des * vinf_ref * vinf_ref)).sqrt();
+    let b1_mag = dot(hyp1.b, hyp1.b).sqrt();
+    if b1_mag < 1e-6 {
+        return None;
+    }
+    let b_des = [
+        (dot(hyp1.b, t_hat) / b1_mag) * b_des_mag,
+        (dot(hyp1.b, r_hat) / b1_mag) * b_des_mag,
+    ];
+    // Residual: B-plane miss plus periapsis timing (scaled to km by v∞ so all
+    // three components condition alike).
+    let shoot = |v: [f64; 3]| -> [f64; 3] {
+        let Some((r, vr)) = rel(v) else {
+            return [1e9, 1e9, 1e9];
+        };
+        let Some(hyp) = hyperbola_at(mu, r, vr) else {
+            return [1e9, 1e9, 1e9];
+        };
+        [
+            dot(hyp.b, t_hat) - b_des[0],
+            dot(hyp.b, r_hat) - b_des[1],
+            hyp.dt_to_periapsis_s * vinf_ref,
+        ]
+    };
+    let (v2, berr) = newton_shoot(&shoot, v1, 15, 1.0);
+    if !berr.is_finite() || berr >= 1e9 {
+        return None;
+    }
+    let (r2, vr2) = rel(v2)?;
+    let hyp2 = hyperbola_at(mu, r2, vr2)?;
+    Some((v2, hyp2, berr))
+}
+
+/// Insertion Δv at a real captured periapsis `rp`, mission-typed, carrying the
+/// finite-burn margin — the arrival cost the corrector and tour report once
+/// they know the achieved periapsis and arrival v∞.
+fn insertion_dv_at(target: BodyId, mission: MissionType, vinf_arr: f64, rp: f64) -> f64 {
+    match mission {
+        MissionType::Flyby => 0.0,
+        MissionType::Orbit => finite_burn_loss(orbit_insertion_dv(target, vinf_arr, rp)),
+        MissionType::Land => arrival_dv_kms(target, vinf_arr, mission),
+    }
+}
+
 /// Desired periapsis radius for the correction, by mission profile. Orbit
 /// matches the 1.5·R parked-orbit assumption baked into `arrival_dv_kms`;
 /// land aims just above the surface (entry interface); flyby takes a safe
@@ -2431,81 +2517,17 @@ pub fn correct_direct(
             ],
         ))
     };
-    let Some((r1, v1)) = rel_state(vinf1) else {
-        return out;
-    };
-    let Some(hyp1) = hyperbola_at(mu, r1, v1) else {
-        return out;
-    };
-    // Frozen B-plane frame from the stage-one asymptote: T̂ in the asymptote's
-    // "horizontal" (⟂ to the reference pole), R̂ completing the triad.
-    let cross = |a: [f64; 3], b: [f64; 3]| {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    };
-    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    let s0_hat = hyp1.s_hat;
-    let t_raw = cross(s0_hat, [0.0, 0.0, 1.0]);
-    let tn = dot(t_raw, t_raw).sqrt();
-    if tn < 1e-9 {
-        return out; // asymptote along the pole; degenerate frame
-    }
-    let t_hat = [t_raw[0] / tn, t_raw[1] / tn, t_raw[2] / tn];
-    let r_hat = cross(s0_hat, t_hat);
-    // Desired |B| for the mission's periapsis radius at the stage-one v∞:
-    // b = rp·sqrt(1 + 2μ/(rp·v∞²)). Direction: keep the stage-one approach
-    // plane (unit B̂ from stage one).
+    // Stage two: retarget in the B-plane onto the mission periapsis.
     let rp_des = target_periapsis_km(target, mission);
-    let vinf_ref = hyp1.vinf_kms;
-    let b_des_mag = rp_des * (1.0 + 2.0 * mu / (rp_des * vinf_ref * vinf_ref)).sqrt();
-    let b1_mag = dot(hyp1.b, hyp1.b).sqrt();
-    if b1_mag < 1e-6 {
+    let Some((vinf2, hyp2, berr)) = bplane_retarget(mu, rp_des, &rel_state, vinf1) else {
         return out;
-    }
-    let b_des = [
-        (dot(hyp1.b, t_hat) / b1_mag) * b_des_mag,
-        (dot(hyp1.b, r_hat) / b1_mag) * b_des_mag,
-    ];
-    // Residual: B-plane miss plus periapsis timing (scaled to km by v∞ so
-    // the three components condition alike).
-    let shoot = |vinf: [f64; 3]| -> [f64; 3] {
-        let Some((r, v)) = rel_state(vinf) else {
-            return [1e9, 1e9, 1e9];
-        };
-        let Some(hyp) = hyperbola_at(mu, r, v) else {
-            return [1e9, 1e9, 1e9];
-        };
-        [
-            dot(hyp.b, t_hat) - b_des[0],
-            dot(hyp.b, r_hat) - b_des[1],
-            hyp.dt_to_periapsis_s * vinf_ref,
-        ]
     };
-    let (vinf2, berr) = newton_shoot(&shoot, vinf1, 15, 1.0);
-    if !berr.is_finite() || berr >= 1e9 {
-        return out;
-    }
     out.vinf_dep = vinf2;
     out.bplane_err_km = Some(berr);
-    if let Some((r2, v2)) = rel_state(vinf2) {
-        if let Some(hyp2) = hyperbola_at(mu, r2, v2) {
-            let rp = hyp2.rp_km;
-            out.periapsis_alt_km = Some(rp - target.radius_km());
-            out.vinf_arr_kms = Some(hyp2.vinf_kms);
-            // Same insertion model as `arrival_dv_kms`, at the real periapsis,
-            // carrying the same finite-burn margin (#18).
-            out.arrival_dv_kms = Some(match mission {
-                MissionType::Flyby => 0.0,
-                MissionType::Orbit => {
-                    finite_burn_loss(orbit_insertion_dv(target, hyp2.vinf_kms, rp))
-                }
-                MissionType::Land => arrival_dv_kms(target, hyp2.vinf_kms, mission),
-            });
-        }
-    }
+    let rp = hyp2.rp_km;
+    out.periapsis_alt_km = Some(rp - target.radius_km());
+    out.vinf_arr_kms = Some(hyp2.vinf_kms);
+    out.arrival_dv_kms = Some(insertion_dv_at(target, mission, hyp2.vinf_kms, rp));
     out
 }
 
@@ -2665,6 +2687,16 @@ pub struct RefinedTour {
     pub genome: Genome,
     /// Patch epochs of the refined schedule: departure, each flyby, arrival.
     pub epochs: Vec<Epoch>,
+    /// Arrival captured periapsis altitude above the target's radius, km —
+    /// `Some` when the final leg was B-plane-targeted onto the mission
+    /// periapsis (the same treatment a direct transfer gets). `None` falls
+    /// back to the center-targeted arrival (the idealized 1.5·R capture).
+    pub arrival_periapsis_alt_km: Option<f64>,
+    /// Arrival B-plane residual, km (`Some` alongside the periapsis).
+    pub arrival_bplane_err_km: Option<f64>,
+    /// Insertion Δv recomputed at the achieved periapsis, km/s (`Some`
+    /// alongside the periapsis). Supersedes the scout's idealized value.
+    pub arrival_dv_kms: Option<f64>,
 }
 
 /// Multi-leg shooting: differential-correct each leg under the full n-body
@@ -2723,13 +2755,22 @@ pub fn refine_tour(
     let mut worst_miss = 0.0f64;
     let mut dsm_total = 0.0f64;
 
+    let last_leg = g.legs.len() - 1;
+    let mut arrival: Option<(f64, f64, f64)> = None; // (periapsis_alt, bplane_err, ins_dv)
+    let mut vinf_arr_override: Option<f64> = None;
     for i in 0..g.legs.len() {
         let body_from = seq[i];
         let body_to = seq[i + 1];
-        // This leg feels every body except its arrival body.
+        // Intermediate legs feel every body except their flyby body — the
+        // assist is modeled as a linked-conic velocity turn at the body centre
+        // (its bending held to a safe periapsis, #16). The *final* leg to the
+        // target instead includes the target's gravity, so its arrival arc
+        // curves to a real, B-plane-targeted periapsis (below) — the same
+        // fidelity a direct transfer gets.
+        let is_final = i == last_leg;
         let mut leg_dyn = dyn_cfg;
         for (k, b) in crate::bodies::ALL_BODIES.iter().enumerate() {
-            leg_dyn.perturbers[k] = *b != body_to;
+            leg_dyn.perturbers[k] = is_final || *b != body_to;
         }
         // Launch from the start body's SOI along the leg's initial velocity
         // direction relative to the body (fixed for the whole correction, so
@@ -2813,15 +2854,50 @@ pub fn refine_tour(
         if truncated.get() {
             return None;
         }
-        worst_miss = worst_miss.max(miss);
+
+        // Final leg: retarget in the B-plane onto the mission periapsis. The
+        // center-targeted `v` (which, with the target's gravity now on, only
+        // stalls at the gravitational-focusing floor — its job is just to
+        // deliver the arc into the SOI) seeds the smooth B-plane Newton. On
+        // success the arrival arc flies to a real, controlled periapsis; the
+        // residual recorded is the B-plane error, not the center-fold miss.
+        let (v_use, leg_miss) = if is_final {
+            let mu_t = cfg.target.gm();
+            let rp_des = target_periapsis_km(cfg.target, cfg.mission);
+            let arrive_ep = epochs[i + 1];
+            let rel = |vv: [f64; 3]| -> Option<([f64; 3], [f64; 3])> {
+                let (pts, _) = fly(vv, 2)?;
+                let (_, sf) = *pts.last().unwrap();
+                let tgt = eph.state(cfg.target, arrive_ep);
+                Some((sub(sf.pos, tgt.pos_km), sub(sf.vel, tgt.vel_km_s)))
+            };
+            match bplane_retarget(mu_t, rp_des, &rel, v) {
+                Some((v2, hyp2, berr)) => {
+                    let rp = hyp2.rp_km;
+                    arrival = Some((
+                        rp - cfg.target.radius_km(),
+                        berr,
+                        insertion_dv_at(cfg.target, cfg.mission, hyp2.vinf_kms, rp),
+                    ));
+                    vinf_arr_override = Some(hyp2.vinf_kms);
+                    (v2, berr)
+                }
+                // Retarget failed (degenerate frame / non-convergence): keep
+                // the center-targeted arc and the idealized capture.
+                None => (v, miss),
+            }
+        } else {
+            (v, miss)
+        };
+        worst_miss = worst_miss.max(leg_miss);
 
         // Dense pass for rendering + the arrival velocity.
-        let (dense, dv) = fly(v, 240)?;
+        let (dense, dv) = fly(v_use, 240)?;
         // The burn charged is the burn flown — the genome vector itself.
         dsm_total += norm(dv);
         // Report the departure velocity that was actually corrected onto the
         // node, not the conic seed it started from.
-        start_vels.push(v);
+        start_vels.push(v_use);
         end_vels.push(dense.last().unwrap().1.vel);
         traj.extend_from_slice(&dense);
     }
@@ -2865,10 +2941,16 @@ pub fn refine_tour(
 
     Some(RefinedTour {
         vinf_dep_kms: norm(sub(start_vels[0], states[0].vel_km_s)),
-        vinf_arr_kms: norm(sub(
-            *end_vels.last().unwrap(),
-            states.last().unwrap().vel_km_s,
-        )),
+        // With the final leg B-plane-targeted the end velocity is a point on
+        // the arrival hyperbola (near periapsis), not the asymptotic v∞ — so
+        // take v∞ from the hyperbola when we have it, and only fall back to the
+        // straight-line end-velocity estimate for a center-targeted arrival.
+        vinf_arr_kms: vinf_arr_override.unwrap_or_else(|| {
+            norm(sub(
+                *end_vels.last().unwrap(),
+                states.last().unwrap().vel_km_s,
+            ))
+        }),
         assist_dv_kms: assist_dv,
         dsm_dv_kms: dsm_total,
         worst_miss_km: worst_miss,
@@ -2876,6 +2958,9 @@ pub fn refine_tour(
         traj,
         genome: g,
         epochs,
+        arrival_periapsis_alt_km: arrival.map(|a| a.0),
+        arrival_bplane_err_km: arrival.map(|a| a.1),
+        arrival_dv_kms: arrival.map(|a| a.2),
     })
 }
 
