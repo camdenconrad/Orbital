@@ -1,0 +1,12 @@
+version=3
+target=Mars
+mission=orbit
+engine=ballistic
+launcher=fh
+route=
+depart_tdb_s=8.476940205951389e8
+legs=2.8631775643736773e2
+vinf=-1.550225727753165e0,2.260312907214572e0,1.8088770400273846e0
+thrust=
+dsm=
+branch=

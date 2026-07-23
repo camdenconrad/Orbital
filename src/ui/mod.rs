@@ -17,7 +17,8 @@ use std::sync::Arc;
 /// Background-built render/search ephemeris table with its valid span.
 type FastEphSlot = Arc<std::sync::Mutex<Option<(Arc<Ephemeris>, Epoch, Epoch)>>>;
 /// Channel carrying a corrected direct transfer back from its worker.
-type DirectRx = std::sync::mpsc::Receiver<(ScState, Vec<(Epoch, ScState)>, f64)>;
+type DirectRx =
+    std::sync::mpsc::Receiver<(ScState, Vec<(Epoch, ScState)>, solver::DirectCorrection)>;
 /// Channel restoring a saved mission after boot.
 type MissionRx = std::sync::mpsc::Receiver<(solver::Solution, SolverConfig)>;
 
@@ -127,6 +128,9 @@ pub struct App {
     porkchop_tex: Option<egui::TextureHandle>,
     /// Miss distance after differential correction of an accepted transfer.
     refined_miss_km: Option<f64>,
+    /// Full two-stage correction result for an accepted direct transfer
+    /// (B-plane error, achieved periapsis) — richer than the bare miss.
+    direct_correction: Option<solver::DirectCorrection>,
     /// In-flight multi-leg tour refinement (runs on a background thread).
     refine_rx: Option<std::sync::mpsc::Receiver<Option<solver::RefinedTour>>>,
     /// In-flight direct-transfer correction (background thread).
@@ -186,6 +190,7 @@ impl App {
             porkchop: None,
             porkchop_tex: None,
             refined_miss_km: None,
+            direct_correction: None,
             refine_rx: None,
             direct_rx: None,
             refined_info: None,
@@ -431,7 +436,25 @@ impl App {
         if cfg.engine == Engine::Ballistic && sol.arrival_dv_kms > 4.0 {
             ui.colored_label(theme::BAD, "⚠ capture beyond chemical propulsion");
         }
-        if let Some(miss) = self.refined_miss_km {
+        if let Some(c) = &self.direct_correction {
+            if let (Some(alt), Some(berr)) = (c.periapsis_alt_km, c.bplane_err_km) {
+                ui.label(format!("periapsis alt {alt:.0} km"));
+                ui.label(
+                    egui::RichText::new(format!("B-plane error {berr:.1} km"))
+                        .weak()
+                        .small(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "targeting residual {:.0} km",
+                        c.center_miss_km
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
+        } else if let Some(miss) = self.refined_miss_km {
             ui.label(
                 egui::RichText::new(format!("targeting residual {miss:.0} km"))
                     .weak()
@@ -818,6 +841,8 @@ impl App {
                 self.sc_state = s0;
                 self.sc_epoch = best.depart;
                 self.sc_days = best.genome.total_tof_days();
+                self.refined_miss_km = None;
+                self.direct_correction = None;
                 if best.flybys.is_empty() && !best.genome.thrust.is_empty() {
                     // Low-thrust: re-fly densely with the throttle profile at
                     // tight tolerance in the background (no Newton pass — the
@@ -849,7 +874,15 @@ impl App {
                             2000,
                             Some(&thrust),
                         );
-                        let _ = tx.send((s0, traj, miss));
+                        let c = solver::DirectCorrection {
+                            vinf_dep: genome.vinf_dep,
+                            center_miss_km: miss,
+                            bplane_err_km: None,
+                            periapsis_alt_km: None,
+                            vinf_arr_kms: None,
+                            arrival_dv_kms: None,
+                        };
+                        let _ = tx.send((s0, traj, c));
                         ctx2.request_repaint();
                     });
                 } else if best.flybys.is_empty() {
@@ -863,14 +896,16 @@ impl App {
                     let eph = self.eph.clone();
                     let dyn_cfg = self.cfg;
                     let target = self.solver_cfg.target;
+                    let mission_ty = self.solver_cfg.mission;
                     let depart = best.depart;
                     let tof = Duration::from_days(best.genome.total_tof_days());
                     let vinf0 = best.genome.vinf_dep;
                     let ctx2 = ctx.clone();
                     std::thread::spawn(move || {
-                        let (vinf, miss) = solver::differential_correct(
-                            &eph, &dyn_cfg, depart, tof, target, vinf0,
+                        let corr = solver::correct_direct(
+                            &eph, &dyn_cfg, depart, tof, target, mission_ty, vinf0,
                         );
+                        let vinf = corr.vinf_dep;
                         let earth = eph.state(BodyId::Earth, depart);
                         let vmag = (vinf[0].powi(2) + vinf[1].powi(2) + vinf[2].powi(2))
                             .sqrt()
@@ -890,7 +925,7 @@ impl App {
                         };
                         let traj =
                             dynamics::propagate(&eph, &dyn_cfg, depart, s0c, tof, 2000);
-                        let _ = tx.send((s0c, traj, miss));
+                        let _ = tx.send((s0c, traj, corr));
                         ctx2.request_repaint();
                     });
                 } else {
@@ -1039,7 +1074,18 @@ score {:.2}",
                 r / AU_KM,
                 self.sc_traj.len()
             ));
-            if let Some(miss) = self.refined_miss_km {
+            if let Some(c) = &self.direct_correction {
+                if let (Some(alt), Some(berr)) = (c.periapsis_alt_km, c.bplane_err_km) {
+                    ui.label(format!(
+                        "corrected: periapsis {alt:.0} km alt, B-plane to {berr:.1} km"
+                    ));
+                } else {
+                    ui.label(format!(
+                        "corrected: hits target to {:.0} km",
+                        c.center_miss_km
+                    ));
+                }
+            } else if let Some(miss) = self.refined_miss_km {
                 ui.label(format!("corrected: hits target to {miss:.0} km"));
             }
             if self.refine_rx.is_some() || self.direct_rx.is_some() {
@@ -1207,11 +1253,23 @@ impl eframe::App for App {
         }
         // Collect a finished direct-transfer correction.
         if let Some(rx) = &self.direct_rx {
-            if let Ok((s0, traj, miss)) = rx.try_recv() {
+            if let Ok((s0, traj, corr)) = rx.try_recv() {
                 self.direct_rx = None;
                 self.sc_state = s0;
                 self.sc_traj = traj;
-                self.refined_miss_km = Some(miss);
+                self.refined_miss_km = Some(corr.bplane_err_km.unwrap_or(corr.center_miss_km));
+                if let Some((sol, _)) = &mut self.mission {
+                    sol.genome.vinf_dep = corr.vinf_dep;
+                    let v = corr.vinf_dep;
+                    sol.vinf_dep_kms = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                    if let Some(va) = corr.vinf_arr_kms {
+                        sol.vinf_arr_kms = va;
+                    }
+                    if let Some(dv) = corr.arrival_dv_kms {
+                        sol.arrival_dv_kms = dv;
+                    }
+                }
+                self.direct_correction = Some(corr);
             }
         }
         // Collect a finished multi-leg refinement.

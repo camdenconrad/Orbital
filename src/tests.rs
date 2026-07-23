@@ -1617,3 +1617,47 @@ fn lambert_branches_are_exposed_and_selectable() {
     });
     assert!(differs, "the branch gene never changed the scored trajectory");
 }
+
+/// Issue #15: position-at-fixed-epoch targeting folds near the planet
+/// (gravitational focusing), so stage one alone stalls at ~9,500 km on this
+/// saved 2026 Mars window. The B-plane stage must converge through that floor
+/// onto the mission's periapsis geometry.
+#[test]
+fn bplane_correction_beats_focusing_floor() {
+    use crate::solver::{correct_direct, solver_dynamics, MissionType};
+    let (eph, label) = Ephemeris::load();
+    if !require_kernels(&label, "SPICE") {
+        return;
+    }
+    let depart = Epoch::from_tdb_seconds(8.476940205951389e8);
+    let tof = Duration::from_days(2.8631775643736773e2);
+    let vinf0 = [
+        -1.550225727753165e0,
+        2.260312907214572e0,
+        1.8088770400273846e0,
+    ];
+    let full = solver_dynamics();
+    let c = correct_direct(&eph, &full, depart, tof, BodyId::Mars, MissionType::Orbit, vinf0);
+    // Stage one stalls at the focusing floor — that is the bug being pinned.
+    assert!(
+        c.center_miss_km > 5_000.0 && c.center_miss_km < 20_000.0,
+        "stage-one floor moved: {:.0} km (formulation changed?)",
+        c.center_miss_km
+    );
+    let berr = c.bplane_err_km.expect("arc reached the SOI; B-plane stage must run");
+    assert!(berr < 50.0, "B-plane error {berr:.1} km");
+    let alt = c.periapsis_alt_km.expect("periapsis defined");
+    // Orbit profile targets rp = 1.5 R, i.e. altitude = 0.5 R ≈ 1695 km.
+    let want = 0.5 * BodyId::Mars.radius_km();
+    assert!(
+        (alt - want).abs() < 100.0,
+        "periapsis altitude {alt:.0} km, wanted ~{want:.0}"
+    );
+    let dv = c.arrival_dv_kms.expect("insertion dv defined");
+    assert!(dv > 0.3 && dv < 3.0, "insertion dv {dv:.2} km/s");
+    println!(
+        "stage1 miss {:.0} km | B-plane err {berr:.2} km | periapsis alt {alt:.0} km | v inf arr {:.2} | insertion dv {dv:.2}",
+        c.center_miss_km,
+        c.vinf_arr_kms.unwrap()
+    );
+}

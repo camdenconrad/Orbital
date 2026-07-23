@@ -2142,6 +2142,269 @@ pub fn differential_correct(
     (best_vinf, best_norm)
 }
 
+/// Outcome of the two-stage direct-transfer correction: the coarse
+/// center-at-epoch Newton pass, then (when the arc reaches the target's SOI)
+/// a B-plane pass that drives the arc onto a requested periapsis geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectCorrection {
+    pub vinf_dep: [f64; 3],
+    /// Stage-one residual: distance from the target's center at the arrival
+    /// epoch, km. Near a planet this bottoms out at a gravitational-focusing
+    /// floor (~10^4 km at Mars) and is NOT a targeting error — see stage two.
+    pub center_miss_km: f64,
+    /// Stage-two residual: |B - B_desired| in the B-plane, km. `None` when
+    /// the arc never reached the SOI hyperbolic regime.
+    pub bplane_err_km: Option<f64>,
+    /// Achieved periapsis altitude above the target's mean radius, km.
+    pub periapsis_alt_km: Option<f64>,
+    /// Arrival v∞ recomputed from the corrected arc's target-relative energy.
+    pub vinf_arr_kms: Option<f64>,
+    /// Insertion Δv recomputed at the achieved periapsis (same parked-orbit
+    /// model as `arrival_dv_kms`, but with the real rp and v∞).
+    pub arrival_dv_kms: Option<f64>,
+}
+
+/// Target-relative osculating hyperbola, the quantities B-plane targeting
+/// needs. Computed from a single (r, v) sample inside the SOI; two-body about
+/// the target is a good local model there even though the arc itself is n-body.
+struct Hyperbola {
+    /// B-vector, km (from the focus to the incoming asymptote, ⟂ to it).
+    b: [f64; 3],
+    /// Incoming asymptote unit vector Ŝ.
+    s_hat: [f64; 3],
+    vinf_kms: f64,
+    rp_km: f64,
+    /// Signed time from the sample epoch to periapsis passage, s.
+    dt_to_periapsis_s: f64,
+}
+
+fn hyperbola_at(mu: f64, r: [f64; 3], v: [f64; 3]) -> Option<Hyperbola> {
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let rn = dot(r, r).sqrt();
+    let v2 = dot(v, v);
+    let eps = v2 / 2.0 - mu / rn;
+    if eps <= 0.0 || rn == 0.0 {
+        return None; // not hyperbolic w.r.t. the target
+    }
+    let vinf = (2.0 * eps).sqrt();
+    let a = -mu / (2.0 * eps); // < 0
+    let h = cross(r, v);
+    let hn = dot(h, h).sqrt();
+    // e-vector from the vis-viva identity; e > 1 guaranteed by eps > 0.
+    let rv = dot(r, v);
+    let e_vec = [
+        ((v2 - mu / rn) * r[0] - rv * v[0]) / mu,
+        ((v2 - mu / rn) * r[1] - rv * v[1]) / mu,
+        ((v2 - mu / rn) * r[2] - rv * v[2]) / mu,
+    ];
+    let e = dot(e_vec, e_vec).sqrt();
+    if e <= 1.0 || hn == 0.0 {
+        return None;
+    }
+    let e_hat = [e_vec[0] / e, e_vec[1] / e, e_vec[2] / e];
+    let h_hat = [h[0] / hn, h[1] / hn, h[2] / hn];
+    let p_hat = cross(h_hat, e_hat);
+    // Incoming asymptote: velocity direction at ν = -ν∞, where cos ν∞ = -1/e.
+    let (c, s) = (1.0 / e, (1.0 - 1.0 / (e * e)).sqrt());
+    let s_hat = [
+        c * e_hat[0] + s * p_hat[0],
+        c * e_hat[1] + s * p_hat[1],
+        c * e_hat[2] + s * p_hat[2],
+    ];
+    let b_mag = hn / vinf;
+    let bv = cross(s_hat, h_hat);
+    // Time to periapsis via the hyperbolic Kepler equation:
+    // r·v = e·sqrt(-a·mu)·sinh H,  M = e·sinh H - H = n(t - t_p).
+    let n = (mu / (-a).powi(3)).sqrt();
+    let sinh_h = rv / (e * ((-a) * mu).sqrt());
+    let hh = sinh_h.asinh();
+    let m = e * sinh_h - hh;
+    Some(Hyperbola {
+        b: [bv[0] * b_mag, bv[1] * b_mag, bv[2] * b_mag],
+        s_hat,
+        vinf_kms: vinf,
+        rp_km: a * (1.0 - e),
+        dt_to_periapsis_s: -m / n,
+    })
+}
+
+/// Desired periapsis radius for the correction, by mission profile. Orbit
+/// matches the 1.5·R parked-orbit assumption baked into `arrival_dv_kms`;
+/// land aims just above the surface (entry interface); flyby takes a safe
+/// close pass.
+fn target_periapsis_km(target: BodyId, mission: MissionType) -> f64 {
+    let r = target.radius_km();
+    match mission {
+        MissionType::Orbit => 1.5 * r,
+        MissionType::Land => 1.02 * r,
+        MissionType::Flyby => 3.0 * r,
+    }
+}
+
+/// Two-stage direct-transfer correction.
+///
+/// Stage one is `differential_correct`: Newton on position-at-fixed-epoch
+/// against the target's center. That formulation cannot converge below a
+/// gravitational-focusing floor — near the planet, gravity deflects close
+/// arcs harder the closer they aim, so the map from v∞ to position-at-epoch
+/// folds and a ring of positions around the center is unreachable (issue
+/// #15; ~9,000 km at Mars for the 2026 window). Stage one's job is only to
+/// deliver the arc into the SOI.
+///
+/// Stage two retargets in the B-plane, where the map is smooth: Newton on
+/// (B·T, B·R, periapsis timing) against a B-vector sized for the mission's
+/// periapsis radius, oriented along the stage-one approach plane so the
+/// corrector changes the arc as little as possible. Axes and the desired B
+/// are frozen at the stage-one solution — re-deriving them per iterate would
+/// let the goalposts move with the walk.
+pub fn correct_direct(
+    eph: &Ephemeris,
+    dyn_cfg: &DynamicsConfig,
+    depart: Epoch,
+    tof: Duration,
+    target: BodyId,
+    mission: MissionType,
+    vinf0: [f64; 3],
+) -> DirectCorrection {
+    let (vinf1, center_miss) = differential_correct(eph, dyn_cfg, depart, tof, target, vinf0);
+    let mut out = DirectCorrection {
+        vinf_dep: vinf1,
+        center_miss_km: center_miss,
+        bplane_err_km: None,
+        periapsis_alt_km: None,
+        vinf_arr_kms: None,
+        arrival_dv_kms: None,
+    };
+    let arrive = depart + tof;
+    if center_miss > soi_km(eph, target, arrive) {
+        return out; // never reached the SOI; B-plane elements undefined
+    }
+    let mu = target.gm();
+    // Target-relative state of the full n-body arc at the arrival epoch.
+    let rel_state = |vinf: [f64; 3]| -> Option<([f64; 3], [f64; 3])> {
+        let earth = eph.state(BodyId::Earth, depart);
+        let vmag = (vinf[0].powi(2) + vinf[1].powi(2) + vinf[2].powi(2)).sqrt();
+        if vmag < 0.05 {
+            return None;
+        }
+        let dir = [vinf[0] / vmag, vinf[1] / vmag, vinf[2] / vmag];
+        let s0 = ScState {
+            pos: [
+                earth.pos_km[0] + dir[0] * 925_000.0,
+                earth.pos_km[1] + dir[1] * 925_000.0,
+                earth.pos_km[2] + dir[2] * 925_000.0,
+            ],
+            vel: [
+                earth.vel_km_s[0] + vinf[0],
+                earth.vel_km_s[1] + vinf[1],
+                earth.vel_km_s[2] + vinf[2],
+            ],
+        };
+        let prop = dynamics::propagate_checked(eph, dyn_cfg, depart, s0, tof, 2, None);
+        if !prop.complete {
+            return None;
+        }
+        let (_, sf) = *prop.points.last().unwrap();
+        let tgt = eph.state(target, arrive);
+        Some((
+            [
+                sf.pos[0] - tgt.pos_km[0],
+                sf.pos[1] - tgt.pos_km[1],
+                sf.pos[2] - tgt.pos_km[2],
+            ],
+            [
+                sf.vel[0] - tgt.vel_km_s[0],
+                sf.vel[1] - tgt.vel_km_s[1],
+                sf.vel[2] - tgt.vel_km_s[2],
+            ],
+        ))
+    };
+    let Some((r1, v1)) = rel_state(vinf1) else {
+        return out;
+    };
+    let Some(hyp1) = hyperbola_at(mu, r1, v1) else {
+        return out;
+    };
+    // Frozen B-plane frame from the stage-one asymptote: T̂ in the asymptote's
+    // "horizontal" (⟂ to the reference pole), R̂ completing the triad.
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let s0_hat = hyp1.s_hat;
+    let t_raw = cross(s0_hat, [0.0, 0.0, 1.0]);
+    let tn = dot(t_raw, t_raw).sqrt();
+    if tn < 1e-9 {
+        return out; // asymptote along the pole; degenerate frame
+    }
+    let t_hat = [t_raw[0] / tn, t_raw[1] / tn, t_raw[2] / tn];
+    let r_hat = cross(s0_hat, t_hat);
+    // Desired |B| for the mission's periapsis radius at the stage-one v∞:
+    // b = rp·sqrt(1 + 2μ/(rp·v∞²)). Direction: keep the stage-one approach
+    // plane (unit B̂ from stage one).
+    let rp_des = target_periapsis_km(target, mission);
+    let vinf_ref = hyp1.vinf_kms;
+    let b_des_mag = rp_des * (1.0 + 2.0 * mu / (rp_des * vinf_ref * vinf_ref)).sqrt();
+    let b1_mag = dot(hyp1.b, hyp1.b).sqrt();
+    if b1_mag < 1e-6 {
+        return out;
+    }
+    let b_des = [
+        (dot(hyp1.b, t_hat) / b1_mag) * b_des_mag,
+        (dot(hyp1.b, r_hat) / b1_mag) * b_des_mag,
+    ];
+    // Residual: B-plane miss plus periapsis timing (scaled to km by v∞ so
+    // the three components condition alike).
+    let shoot = |vinf: [f64; 3]| -> [f64; 3] {
+        let Some((r, v)) = rel_state(vinf) else {
+            return [1e9, 1e9, 1e9];
+        };
+        let Some(hyp) = hyperbola_at(mu, r, v) else {
+            return [1e9, 1e9, 1e9];
+        };
+        [
+            dot(hyp.b, t_hat) - b_des[0],
+            dot(hyp.b, r_hat) - b_des[1],
+            hyp.dt_to_periapsis_s * vinf_ref,
+        ]
+    };
+    let (vinf2, berr) = newton_shoot(&shoot, vinf1, 15, 1.0);
+    if !berr.is_finite() || berr >= 1e9 {
+        return out;
+    }
+    out.vinf_dep = vinf2;
+    out.bplane_err_km = Some(berr);
+    if let Some((r2, v2)) = rel_state(vinf2) {
+        if let Some(hyp2) = hyperbola_at(mu, r2, v2) {
+            let rp = hyp2.rp_km;
+            out.periapsis_alt_km = Some(rp - target.radius_km());
+            out.vinf_arr_kms = Some(hyp2.vinf_kms);
+            // Same insertion model as `arrival_dv_kms`, at the real periapsis.
+            out.arrival_dv_kms = Some(match mission {
+                MissionType::Flyby => 0.0,
+                MissionType::Orbit => {
+                    let vp_hyp = (hyp2.vinf_kms.powi(2) + 2.0 * mu / rp).sqrt();
+                    let vp_ell = (mu / rp * (1.0 + 0.95)).sqrt();
+                    vp_hyp - vp_ell
+                }
+                MissionType::Land => arrival_dv_kms(target, hyp2.vinf_kms, mission),
+            });
+        }
+    }
+    out
+}
+
 /// Damped Newton on a 3-vector residual with a finite-difference Jacobian.
 /// Shared by every shooting stage; returns the corrected vector and the final
 /// residual norm. Deterministic: fixed iteration count and step order.
