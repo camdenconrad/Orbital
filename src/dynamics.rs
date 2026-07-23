@@ -40,6 +40,12 @@ pub struct DynamicsConfig {
     /// representative value so accepted trajectories carry the cruise
     /// perturbation. A cannonball model — no attitude, no eclipse shadow.
     pub srp_cr_area_mass: f64,
+    /// Include the J2 zonal (oblateness) term for close approaches. Off by
+    /// default (bit-unchanged coarse propagation); mission-grade configs
+    /// enable it so an arrival/flyby periapsis passage feels the real
+    /// non-spherical field. Naturally negligible far from any body (falls as
+    /// 1/r⁴), so it's distance-gated and only bites near an oblate body.
+    pub oblateness: bool,
 }
 
 impl Default for DynamicsConfig {
@@ -50,6 +56,7 @@ impl Default for DynamicsConfig {
             rel_tol: 1e-10,
             max_steps: 2_000_000,
             srp_cr_area_mass: 0.0,
+            oblateness: false,
         }
     }
 }
@@ -93,6 +100,24 @@ pub fn acceleration(
             let f = mu / (c2 * r2 * rn);
             for k in 0..3 {
                 acc[k] += f * ((4.0 * mu / rn - v2) * r[k] + 4.0 * rv * v[k]);
+            }
+        }
+        // J2 oblateness — only meaningful during a close approach (it falls as
+        // 1/r⁴), so gate on distance and skip the trig otherwise.
+        if cfg.oblateness {
+            if let Some((j2, r_eq, ra_deg, dec_deg)) = body.j2_params() {
+                if rn < 100.0 * r_eq {
+                    // Spin-pole unit vector p̂ from IAU RA/Dec (ICRF).
+                    let (ra, dec) = (ra_deg.to_radians(), dec_deg.to_radians());
+                    let p = [dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()];
+                    let r_hat = [r[0] / rn, r[1] / rn, r[2] / rn];
+                    let u = r_hat[0] * p[0] + r_hat[1] * p[1] + r_hat[2] * p[2];
+                    // a_J2 = -(3/2) J2 μ R_eq²/r⁴ [ (1 - 5u²) r̂ + 2u p̂ ]  (Vallado).
+                    let k = -1.5 * j2 * mu * r_eq * r_eq / (r2 * r2);
+                    for c in 0..3 {
+                        acc[c] += k * ((1.0 - 5.0 * u * u) * r_hat[c] + 2.0 * u * p[c]);
+                    }
+                }
             }
         }
     }

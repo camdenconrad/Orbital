@@ -789,6 +789,65 @@ fn veega_tour_search_is_sane() {
     }
 }
 
+/// Issue #21: the J2 oblateness term must match the closed form, act only
+/// near a body, and vanish when disabled. Earth's pole is ~ICRF +Z, giving a
+/// clean geometry to check: in the equatorial plane J2 pushes inward and
+/// slightly toward the equator; on the spin axis it pushes inward, doubled.
+#[test]
+fn j2_oblateness_matches_closed_form() {
+    let eph = Ephemeris::Kepler;
+    let epoch = j2000();
+    let mut cfg = DynamicsConfig {
+        relativity: false,
+        oblateness: true,
+        ..Default::default()
+    };
+    // Earth only, so we isolate its J2 (and its point mass).
+    cfg.perturbers = [false; ALL_BODIES.len()];
+    let earth_idx = ALL_BODIES.iter().position(|b| *b == BodyId::Earth).unwrap();
+    cfg.perturbers[earth_idx] = true;
+    let e = eph.state(BodyId::Earth, epoch);
+    let (j2, r_eq, _, _) = BodyId::Earth.j2_params().unwrap();
+    let mu = BodyId::Earth.gm();
+    // A point 3 equatorial radii out, in the equatorial plane (+x from Earth).
+    let r = 3.0 * r_eq;
+    let sc = ScState { pos: [e.pos_km[0] + r, e.pos_km[1], e.pos_km[2]], vel: [0.0; 3] };
+    let a = dynamics::acceleration(&eph, &cfg, epoch, &sc);
+    // Subtract the point-mass part to isolate J2 (both along -x here).
+    let a_point = -mu / (r * r);
+    let a_j2_x = a[0] - a_point;
+    // Closed form on the equator (u = r̂·p̂ = 0): a_J2 = -(3/2)J2 μ R²/r⁴ · r̂.
+    let expect = -1.5 * j2 * mu * r_eq * r_eq / r.powi(4);
+    assert!(
+        (a_j2_x - expect).abs() < 1e-6 * expect.abs(),
+        "equatorial J2 {a_j2_x:e} vs {expect:e}"
+    );
+    // On the spin axis (+z), u = 1: the z-coefficient is (3 - 5u²) = -2, so
+    // a_J2_z = k·u·(3-5u²) = -2k = -2·expect — outward, twice the equatorial
+    // magnitude (Vallado: the K-component carries 3-5(z/r)², not 1-5(z/r)²).
+    let sc_pole = ScState { pos: [e.pos_km[0], e.pos_km[1], e.pos_km[2] + r], vel: [0.0; 3] };
+    let ap = dynamics::acceleration(&eph, &cfg, epoch, &sc_pole);
+    let a_j2_z = ap[2] - (-mu / (r * r));
+    assert!((a_j2_z + 2.0 * expect).abs() < 1e-6 * expect.abs(), "polar J2 {a_j2_z:e}");
+    // Far away (200 R_eq > the 100 R_eq gate) the J2 term is not applied:
+    // the residual over point mass is far below the equatorial J2 signal.
+    let far = 200.0 * r_eq;
+    let sc_far = ScState { pos: [e.pos_km[0] + far, e.pos_km[1], e.pos_km[2]], vel: [0.0; 3] };
+    let af = dynamics::acceleration(&eph, &cfg, epoch, &sc_far);
+    let far_point = -mu / (far * far);
+    assert!(
+        (af[0] - far_point).abs() < 1e-9 * far_point.abs(),
+        "J2 leaked past the gate"
+    );
+    // Disabled: pure point mass (bit-unchanged path — only rounding differs).
+    cfg.oblateness = false;
+    let a_off = dynamics::acceleration(&eph, &cfg, epoch, &sc);
+    assert!(
+        (a_off[0] - a_point).abs() < 1e-12 * a_point.abs(),
+        "J2 applied with flag off"
+    );
+}
+
 /// Issue #19: solar radiation pressure must push directly away from the Sun
 /// with the analytic 1/r² cannonball magnitude, and be off when disabled.
 #[test]

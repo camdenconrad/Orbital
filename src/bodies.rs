@@ -164,6 +164,26 @@ impl BodyId {
         }
     }
 
+    /// Oblateness parameters for the J2 zonal term: `(J2, equatorial radius km,
+    /// pole right ascension deg, pole declination deg)` in the ICRF/J2000
+    /// frame the ephemeris uses. `None` for bodies whose oblateness is
+    /// negligible or whose spin pole isn't modeled (Sun, small moons,
+    /// asteroids). Values are standard IAU / planetary-fact-sheet figures.
+    pub fn j2_params(self) -> Option<(f64, f64, f64, f64)> {
+        Some(match self {
+            BodyId::Mercury => (6.0e-5, 2_440.5, 281.0103, 61.4155),
+            BodyId::Venus => (4.458e-6, 6_051.8, 272.76, 67.16),
+            BodyId::Earth => (1.082_63e-3, 6_378.137, 0.0, 90.0),
+            BodyId::Moon => (2.0323e-4, 1_738.1, 269.9949, 66.5392),
+            BodyId::Mars => (1.960_45e-3, 3_396.19, 317.681_43, 52.886_50),
+            BodyId::Jupiter => (1.4696e-2, 71_492.0, 268.056, 64.495),
+            BodyId::Saturn => (1.6291e-2, 60_268.0, 40.589, 83.537),
+            BodyId::Uranus => (3.510e-3, 25_559.0, 257.311, -15.175),
+            BodyId::Neptune => (3.408e-3, 24_764.0, 299.36, 43.46),
+            _ => return None,
+        })
+    }
+
     /// Display color (linear-ish RGB).
     pub fn color(self) -> [f32; 3] {
         match self {

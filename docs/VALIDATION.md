@@ -74,10 +74,16 @@ the 1PN Schwarzschild correction per body (the Sun's term reproduces Mercury's
 trajectory corrector and tour refinement) additionally carries solar radiation
 pressure as a cannonball term — Cr·(A/m) ≈ 0.0195 m²/kg, falling as 1/r² away
 from the Sun — so B-plane targeting flies through the cruise perturbation
-rather than below it. The coarse beam scout leaves SRP off to stay cheap; the
-corrector reconverges on the target regardless (its whole job). Planetary
-oblateness (J2) is not yet modeled — it matters only for very low flybys and
-needs per-body pole orientation (tracked separately).
+rather than below it. It also carries the **J2** zonal (oblateness) term during
+close approaches: the closed-form Vallado acceleration about each body's IAU
+spin pole (ICRF RA/Dec), distance-gated so it is skipped in deep space (it
+falls as 1/r⁴) and bites only near an oblate body. J2 is active on the arrival
+periapsis passage — Mars orbit insertion's captured periapsis shifts ~2 km with
+J2 on, which the B-plane corrector then targets (`j2_oblateness_matches_closed_form`
+checks the term against the closed form). The coarse beam scout leaves SRP and
+J2 off to stay cheap; the corrector reconverges regardless. J2 near
+*intermediate* flybys stays dormant until those legs integrate the flyby
+body's gravity (the full-integrated-flyby follow-up).
 
 **Launch feasibility.** The launcher C3 cap is a hard bound (a candidate the
 vehicle can't inject is ranked below every feasible one, not charged a

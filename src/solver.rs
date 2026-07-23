@@ -1060,6 +1060,8 @@ pub fn solver_dynamics() -> DynamicsConfig {
         // B-plane targeting must fly through. The coarse beam scout leaves it
         // at zero (Default) to stay cheap.
         srp_cr_area_mass: 1.3 * 0.015,
+        // …and J2, so the arrival periapsis passage feels the oblate field.
+        oblateness: true,
         ..Default::default()
     }
 }
@@ -2744,8 +2746,9 @@ pub fn refine_tour(
 
     let dyn_cfg = DynamicsConfig {
         rel_tol: 1e-9,
-        // Mission-grade refinement carries SRP, like `solver_dynamics`.
+        // Mission-grade refinement carries SRP + J2, like `solver_dynamics`.
         srp_cr_area_mass: 1.3 * 0.015,
+        oblateness: true,
         ..Default::default()
     };
 
