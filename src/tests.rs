@@ -1618,6 +1618,52 @@ fn lambert_branches_are_exposed_and_selectable() {
     assert!(differs, "the branch gene never changed the scored trajectory");
 }
 
+/// Restore path (issue #15 follow-up): reopening a mission re-runs
+/// `correct_direct` from the persisted (already-corrected) v∞. That second
+/// pass must stay converged, not drift back up the focusing fold — otherwise
+/// a reopen would degrade the trajectory it just restored.
+#[test]
+fn bplane_correction_is_idempotent_on_reload() {
+    use crate::solver::{correct_direct, solver_dynamics, MissionType};
+    let (eph, label) = Ephemeris::load();
+    if !require_kernels(&label, "SPICE") {
+        return;
+    }
+    let depart = Epoch::from_tdb_seconds(8.476940205951389e8);
+    let tof = Duration::from_days(2.8631775643736773e2);
+    let full = solver_dynamics();
+    let first = correct_direct(
+        &eph,
+        &full,
+        depart,
+        tof,
+        BodyId::Mars,
+        MissionType::Orbit,
+        [-1.550225727753165, 2.260312907214572, 1.8088770400273846],
+    );
+    // Re-correct from the persisted v∞, exactly as boot restore does.
+    let second = correct_direct(
+        &eph,
+        &full,
+        depart,
+        tof,
+        BodyId::Mars,
+        MissionType::Orbit,
+        first.vinf_dep,
+    );
+    let a = first.periapsis_alt_km.expect("first pass has periapsis");
+    let b = second.periapsis_alt_km.expect("reload pass has periapsis");
+    assert!(
+        (a - b).abs() < 20.0,
+        "reload drifted periapsis {a:.0} -> {b:.0} km"
+    );
+    assert!(
+        second.bplane_err_km.unwrap() < 50.0,
+        "reload left {:.1} km B-plane error",
+        second.bplane_err_km.unwrap()
+    );
+}
+
 /// Issue #15: position-at-fixed-epoch targeting folds near the planet
 /// (gravitational focusing), so stage one alone stalls at ~9,500 km on this
 /// saved 2026 Mars window. The B-plane stage must converge through that floor

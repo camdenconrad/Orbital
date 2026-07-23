@@ -235,6 +235,53 @@ impl App {
         self.start_search_with(ctx, self.solver_cfg.clone(), self.epoch());
     }
 
+    /// Spawn the two-stage differential + B-plane correction for a direct
+    /// (no-flyby, ballistic) transfer. Results arrive on `direct_rx` and the
+    /// receiver in `update` merges the corrected v∞/Δv into the mission and
+    /// re-saves it. Shared by Accept and by mission restore, so a reopened
+    /// mission recovers the same B-plane readout the accepted one had.
+    fn spawn_direct_correction(
+        &mut self,
+        sol: &solver::Solution,
+        target: BodyId,
+        mission: MissionType,
+        ctx: &egui::Context,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.direct_rx = Some(rx);
+        let eph = self.eph.clone();
+        let dyn_cfg = self.cfg;
+        let depart = sol.depart;
+        let tof = Duration::from_days(sol.genome.total_tof_days());
+        let vinf0 = sol.genome.vinf_dep;
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let corr =
+                solver::correct_direct(&eph, &dyn_cfg, depart, tof, target, mission, vinf0);
+            let vinf = corr.vinf_dep;
+            let earth = eph.state(BodyId::Earth, depart);
+            let vmag = (vinf[0].powi(2) + vinf[1].powi(2) + vinf[2].powi(2))
+                .sqrt()
+                .max(0.05);
+            let dir = [vinf[0] / vmag, vinf[1] / vmag, vinf[2] / vmag];
+            let s0c = ScState {
+                pos: [
+                    earth.pos_km[0] + dir[0] * 925_000.0,
+                    earth.pos_km[1] + dir[1] * 925_000.0,
+                    earth.pos_km[2] + dir[2] * 925_000.0,
+                ],
+                vel: [
+                    earth.vel_km_s[0] + vinf[0],
+                    earth.vel_km_s[1] + vinf[1],
+                    earth.vel_km_s[2] + vinf[2],
+                ],
+            };
+            let traj = dynamics::propagate(&eph, &dyn_cfg, depart, s0c, tof, 2000);
+            let _ = tx.send((s0c, traj, corr));
+            ctx2.request_repaint();
+        });
+    }
+
     fn start_search_with(&mut self, ctx: &egui::Context, cfg: SolverConfig, epoch0: Epoch) {
         let shared = solver::Shared::new();
         self.solver = Some(shared.clone());
@@ -891,43 +938,12 @@ impl App {
                     // here. The scouted path shows immediately; the corrected
                     // one swaps in when ready.
                     self.sc_traj = best.traj.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    self.direct_rx = Some(rx);
-                    let eph = self.eph.clone();
-                    let dyn_cfg = self.cfg;
-                    let target = self.solver_cfg.target;
-                    let mission_ty = self.solver_cfg.mission;
-                    let depart = best.depart;
-                    let tof = Duration::from_days(best.genome.total_tof_days());
-                    let vinf0 = best.genome.vinf_dep;
-                    let ctx2 = ctx.clone();
-                    std::thread::spawn(move || {
-                        let corr = solver::correct_direct(
-                            &eph, &dyn_cfg, depart, tof, target, mission_ty, vinf0,
-                        );
-                        let vinf = corr.vinf_dep;
-                        let earth = eph.state(BodyId::Earth, depart);
-                        let vmag = (vinf[0].powi(2) + vinf[1].powi(2) + vinf[2].powi(2))
-                            .sqrt()
-                            .max(0.05);
-                        let dir = [vinf[0] / vmag, vinf[1] / vmag, vinf[2] / vmag];
-                        let s0c = ScState {
-                            pos: [
-                                earth.pos_km[0] + dir[0] * 925_000.0,
-                                earth.pos_km[1] + dir[1] * 925_000.0,
-                                earth.pos_km[2] + dir[2] * 925_000.0,
-                            ],
-                            vel: [
-                                earth.vel_km_s[0] + vinf[0],
-                                earth.vel_km_s[1] + vinf[1],
-                                earth.vel_km_s[2] + vinf[2],
-                            ],
-                        };
-                        let traj =
-                            dynamics::propagate(&eph, &dyn_cfg, depart, s0c, tof, 2000);
-                        let _ = tx.send((s0c, traj, corr));
-                        ctx2.request_repaint();
-                    });
+                    self.spawn_direct_correction(
+                        &best,
+                        self.solver_cfg.target,
+                        self.solver_cfg.mission,
+                        ctx,
+                    );
                 } else {
                     // Show the patched-conic path immediately; multi-leg
                     // shooting refines it to mission grade in the background
@@ -1248,7 +1264,23 @@ impl eframe::App for App {
                 self.mission_rx = None;
                 self.sc_traj = sol.traj.clone();
                 self.accepted = Some((cfg.mission, cfg.target));
-                self.mission = Some((sol, cfg));
+                self.solver_cfg = cfg.clone();
+                // Re-run the direct correction so a reopened mission shows the
+                // same B-plane / periapsis readout it had when accepted (the
+                // correction is a derived quantity, not stored in the file).
+                // Only direct ballistic transfers use `correct_direct`; tours
+                // and low-thrust keep their persisted genome without a
+                // background re-solve on boot (refinement is far too costly to
+                // run unprompted at startup).
+                let is_direct_ballistic = cfg.route.is_empty()
+                    && cfg.engine == Engine::Ballistic
+                    && sol.genome.thrust.is_empty()
+                    && sol.flybys.is_empty();
+                let (target, mission_ty) = (cfg.target, cfg.mission);
+                self.mission = Some((sol.clone(), cfg));
+                if is_direct_ballistic {
+                    self.spawn_direct_correction(&sol, target, mission_ty, ctx);
+                }
             }
         }
         // Collect a finished direct-transfer correction.
@@ -1270,6 +1302,12 @@ impl eframe::App for App {
                     }
                 }
                 self.direct_correction = Some(corr);
+                // Persist the corrected genome: the accepted save captured the
+                // pre-correction scout, so without this the on-disk mission
+                // keeps stale v∞/Δv and a reopen loses the correction.
+                if let Some((sol, cfg)) = &self.mission {
+                    save_mission(sol, cfg);
+                }
             }
         }
         // Collect a finished multi-leg refinement.
@@ -1309,6 +1347,11 @@ impl eframe::App for App {
                         );
                     }
                     self.refined_info = Some(info);
+                    // Refinement moves patch epochs and leg v∞; persist the
+                    // schedule actually flown so a reopen restores it.
+                    if let Some((sol, cfg)) = &self.mission {
+                        save_mission(sol, cfg);
+                    }
                 } else {
                     self.refined_info = Some("tour refinement failed (kept conic path)".into());
                 }
