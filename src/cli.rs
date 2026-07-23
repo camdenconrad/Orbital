@@ -76,10 +76,14 @@ pub fn headless_search(target: Option<&str>, start: Option<&str>) {
     let mut cfg = SolverConfig::default(); // auto_route defaults on
     let mut steps: usize = 400;
     let mut restarts: usize = 1;
+    let mut save_path: Option<String> = None;
     // Route: any arg of the form via=venus,earth,earth (checked below).
     for arg in std::env::args().skip(2) {
         if let Some(v) = arg.strip_prefix("steps=") {
             steps = v.parse().unwrap_or(400);
+        }
+        if let Some(v) = arg.strip_prefix("save=") {
+            save_path = Some(v.to_string());
         }
         if let Some(v) = arg.strip_prefix("beam=") {
             cfg.beam_width = v.parse().unwrap_or(cfg.beam_width);
@@ -224,6 +228,7 @@ pub fn headless_search(target: Option<&str>, start: Option<&str>) {
             println!("\nBEST: score {:.3} | {}", o.score, describe(o));
         }
         println!("{evals} evals in {dt:.1}s ({:.0} evals/s)", evals as f64 / dt);
+        save_result(&save_path, overall.as_ref(), &cfg);
         return;
     }
     // Deterministic multi-start: seeds seed, seed+1, … explore independently;
@@ -257,4 +262,21 @@ pub fn headless_search(target: Option<&str>, start: Option<&str>) {
         "{restarts} restart(s) × {steps} steps, {evals} evals in {dt:.1}s ({:.0} evals/s)",
         evals as f64 / dt
     );
+    save_result(&save_path, overall.as_ref(), &cfg);
+}
+
+/// Write the winning trajectory to a loadable mission file, if `save=` was
+/// given. The saved genome is the scouted solution — the GUI re-runs the
+/// differential/B-plane correction on load — so a headless search and the GUI
+/// agree on the same mission.
+fn save_result(save_path: &Option<String>, sol: Option<&solver::Solution>, cfg: &SolverConfig) {
+    let Some(path) = save_path else { return };
+    let Some(sol) = sol else {
+        eprintln!("nothing to save: no feasible solution found");
+        return;
+    };
+    match std::fs::write(path, crate::mission::serialize(sol, cfg)) {
+        Ok(()) => println!("wrote mission to {path}"),
+        Err(e) => eprintln!("could not write {path}: {e}"),
+    }
 }

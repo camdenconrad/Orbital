@@ -50,11 +50,14 @@ cargo run --release -- search Mars 2026-07-20
 # Constrain a gravity-assist route and search budget
 cargo run --release -- search Jupiter 2028-01-01 via=venus,earth,earth steps=1500
 
+# Write the winning trajectory to a mission file the GUI can open
+cargo run --release -- search Mars 2026-11-01 via=direct save=mission.orbital
+
 # Tour mode launches the GUI pre-seeded with a route search
 cargo run --release -- tour Jupiter via=venus,earth,earth
 ```
 
-`search` arguments (any order after the target): a `YYYY-MM-DD` start date, `via=body,body,…` (or `via=direct`), `mode=flyby|orbit|land`, `engine=ballistic|nstar|next|aeps`, `beam=N`, `steps=N`, `restarts=N`, `seed=N`.
+`search` arguments (any order after the target): a `YYYY-MM-DD` start date, `via=body,body,…` (or `via=direct`), `mode=flyby|orbit|land`, `engine=ballistic|nstar|next|aeps`, `beam=N`, `steps=N`, `restarts=N`, `seed=N`, `save=<path>` (write a loadable mission file). A headless `save=` mission stores the scouted trajectory; opening it in the GUI re-runs the differential/B-plane correction, so both agree on the same mission.
 
 ## Status
 
