@@ -789,6 +789,36 @@ fn veega_tour_search_is_sane() {
     }
 }
 
+/// Issue #19: solar radiation pressure must push directly away from the Sun
+/// with the analytic 1/r² cannonball magnitude, and be off when disabled.
+#[test]
+fn srp_pushes_away_from_sun_with_inverse_square_magnitude() {
+    let eph = Ephemeris::Kepler;
+    let epoch = j2000();
+    // Isolate SRP: no gravity, no relativity.
+    let mut cfg = DynamicsConfig {
+        relativity: false,
+        srp_cr_area_mass: 1.3 * 0.015,
+        ..Default::default()
+    };
+    cfg.perturbers = [false; ALL_BODIES.len()];
+    // Spacecraft 1 AU from the Sun along +x (states are heliocentric).
+    let at = |r_km: f64| ScState { pos: [r_km, 0.0, 0.0], vel: [0.0; 3] };
+    let a1 = dynamics::acceleration(&eph, &cfg, epoch, &at(AU_KM));
+    // Analytic: Cr·(A/m)·P_1AU·(AU/r)² ×1e-3, along +x, away from Sun.
+    let expect = 1.3 * 0.015 * 4.5344e-6 * 1e-3;
+    assert!((a1[0] - expect).abs() < 1e-3 * expect, "SRP mag {} vs {expect}", a1[0]);
+    assert!(a1[0] > 0.0, "SRP must push away from the Sun (+x)");
+    assert!(a1[1].abs() < 1e-14 && a1[2].abs() < 1e-14, "SRP not radial");
+    // Inverse-square: at 2 AU the magnitude is a quarter.
+    let a2 = dynamics::acceleration(&eph, &cfg, epoch, &at(2.0 * AU_KM));
+    assert!((a2[0] - a1[0] / 4.0).abs() < 1e-3 * a1[0], "not 1/r²: {} vs {}", a2[0], a1[0] / 4.0);
+    // Disabled by default.
+    cfg.srp_cr_area_mass = 0.0;
+    let off = dynamics::acceleration(&eph, &cfg, epoch, &at(AU_KM));
+    assert_eq!(off, [0.0; 3], "SRP leaked with coefficient zero");
+}
+
 /// Issue #18: capture Δv must carry a finite-burn margin that grows with burn
 /// size, so a high-v∞ arrival is charged more than the impulsive ideal and
 /// isn't preferred only because the loss was omitted.

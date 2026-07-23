@@ -68,6 +68,17 @@ resonances — the domain trick that makes resonant-return tours findable.
 A manually specified VEEGA (`via=venus,earth,earth`, seed 12) still beats it
 (score 4.31 vs 6.15); deeper screening budgets close that gap (`steps=`).
 
+**Force model.** Point-mass Newtonian gravity from all catalogued bodies plus
+the 1PN Schwarzschild correction per body (the Sun's term reproduces Mercury's
+43″/century perihelion advance). Mission-grade propagation (the accepted-
+trajectory corrector and tour refinement) additionally carries solar radiation
+pressure as a cannonball term — Cr·(A/m) ≈ 0.0195 m²/kg, falling as 1/r² away
+from the Sun — so B-plane targeting flies through the cruise perturbation
+rather than below it. The coarse beam scout leaves SRP off to stay cheap; the
+corrector reconverges on the target regardless (its whole job). Planetary
+oblateness (J2) is not yet modeled — it matters only for very low flybys and
+needs per-body pole orientation (tracked separately).
+
 **Launch feasibility.** The launcher C3 cap is a hard bound (a candidate the
 vehicle can't inject is ranked below every feasible one, not charged a
 purchasable penalty). The usable cap additionally derates with the

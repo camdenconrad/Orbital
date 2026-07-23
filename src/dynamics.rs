@@ -12,7 +12,7 @@
 //!
 //! Integrator: adaptive Dormand–Prince 5(4).
 
-use crate::bodies::{BodyId, ALL_BODIES, C_KM_S};
+use crate::bodies::{BodyId, ALL_BODIES, AU_KM, C_KM_S};
 use crate::ephemeris::Ephemeris;
 use hifitime::{Duration, Epoch};
 
@@ -34,6 +34,12 @@ pub struct DynamicsConfig {
     /// the adaptive step collapses, we stop rather than grind — callers see a
     /// truncated trajectory (and, in the solver, a terrible score).
     pub max_steps: usize,
+    /// Solar-radiation-pressure coefficient Cr·(A/m) in m²/kg. Zero disables
+    /// SRP (the default, so coarse scouting stays cheap and existing
+    /// propagation is bit-unchanged); mission-grade configs set a
+    /// representative value so accepted trajectories carry the cruise
+    /// perturbation. A cannonball model — no attitude, no eclipse shadow.
+    pub srp_cr_area_mass: f64,
 }
 
 impl Default for DynamicsConfig {
@@ -43,6 +49,7 @@ impl Default for DynamicsConfig {
             perturbers: [true; ALL_BODIES.len()],
             rel_tol: 1e-10,
             max_steps: 2_000_000,
+            srp_cr_area_mass: 0.0,
         }
     }
 }
@@ -89,8 +96,29 @@ pub fn acceleration(
             }
         }
     }
+    // Solar radiation pressure: a cannonball push directly away from the Sun,
+    // falling off as 1/r². Cr·(A/m) is carried in the config; zero skips it.
+    if cfg.srp_cr_area_mass > 0.0 {
+        let sun = eph.state(BodyId::Sun, epoch);
+        let r = [
+            state.pos[0] - sun.pos_km[0],
+            state.pos[1] - sun.pos_km[1],
+            state.pos[2] - sun.pos_km[2],
+        ];
+        let rn = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+        if rn > 1.0 {
+            // a = Cr·(A/m)·P_1AU·(AU/r)², N/kg = m/s²; ×1e-3 → km/s².
+            let scale = cfg.srp_cr_area_mass * SRP_P_1AU_N_M2 * (AU_KM / rn).powi(2) * 1e-3;
+            for k in 0..3 {
+                acc[k] += scale * r[k] / rn;
+            }
+        }
+    }
     acc
 }
+
+/// Solar radiation pressure at 1 AU, N/m² (= L☉ / (4π c AU²)).
+const SRP_P_1AU_N_M2: f64 = 4.5344e-6;
 
 /// Dormand–Prince 5(4) coefficients.
 #[rustfmt::skip]
