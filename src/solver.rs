@@ -217,6 +217,23 @@ fn has_usable_atmosphere(b: BodyId) -> bool {
     matches!(b, BodyId::Venus | BodyId::Earth | BodyId::Mars | BodyId::Titan)
 }
 
+/// Lowest periapsis a gravity assist may safely fly, km (radius from the
+/// body's center). This is the floor the flyby geometry is held to: an
+/// atmospheric body must be cleared above its sensible atmosphere, a gas
+/// giant well above its cloud tops, an airless body only grazed. Passing
+/// below it is unphysical (drag/impact), so scoring charges the deficit as
+/// if the remaining turn were bought impulsively at this altitude.
+pub(crate) fn min_flyby_periapsis_km(b: BodyId) -> f64 {
+    let r = b.radius_km();
+    if is_gas_giant(b) {
+        1.5 * r // clear of cloud tops and the worst of the radiation belts
+    } else if has_usable_atmosphere(b) {
+        r + 200.0 // above the sensible atmosphere (entry interface ~ tens of km)
+    } else {
+        (1.05 * r).max(r + 50.0) // airless: a low but non-grazing pass
+    }
+}
+
 /// Δv charged at the target for the chosen mission type, km/s.
 pub fn arrival_dv_kms(body: BodyId, vinf_kms: f64, mission: MissionType) -> f64 {
     let mu = body.gm();
@@ -1311,24 +1328,30 @@ fn evaluate_tour(
         }
         // Powered flyby: the magnitude mismatch is paid in Δv.
         let mut dv = (nin - nout).abs();
-        // Turn achievable at minimum safe periapsis for the mean v∞.
+        // Turn achievable at the minimum *safe* periapsis for the mean v∞.
         let vinf = 0.5 * (nin + nout);
         let mu_b = body.gm();
-        let rp_min = 1.1 * body.radius_km();
+        let rp_min = min_flyby_periapsis_km(body);
         let delta_max = 2.0 * (mu_b / (mu_b + rp_min * vinf * vinf)).asin();
         let cos_turn = ((vin[0] * vout[0] + vin[1] * vout[1] + vin[2] * vout[2])
             / (nin * nout))
             .clamp(-1.0, 1.0);
         let turn = cos_turn.acos();
+        // Periapsis actually flown: the free-turn geometry when the bend fits
+        // inside the safe limit, otherwise the safe floor (the deficit is then
+        // bought impulsively there). Never the misleading 0 the old clamp
+        // reported for an over-tight pass.
         let periapsis_alt_km = if turn <= delta_max && turn > 1e-6 {
-            // Invert δ(r_p) for the implied periapsis.
             let s = (turn / 2.0).sin();
             (mu_b * (1.0 - s) / (s * vinf * vinf) - body.radius_km()).max(0.0)
         } else {
-            0.0
+            rp_min - body.radius_km()
         };
         if turn > delta_max {
-            // Charge the deficit as if rotated impulsively at v∞.
+            // Bending beyond the safe limit costs the deficit as if the extra
+            // rotation were bought impulsively at the safe periapsis — this is
+            // the penalty that keeps the optimizer off unphysical grazing/
+            // sub-surface passes.
             dv += 2.0 * vinf * ((turn - delta_max) / 2.0).sin();
         }
         assist_dv += dv;
@@ -2730,17 +2753,19 @@ pub fn refine_tour(
         let mut dv = (nin - nout).abs();
         let vinf = 0.5 * (nin + nout);
         let mu_b = body.gm();
-        let rp_min = 1.1 * body.radius_km();
+        let rp_min = min_flyby_periapsis_km(body);
         let delta_max = 2.0 * (mu_b / (mu_b + rp_min * vinf * vinf)).asin();
         let cos_turn =
             ((vin[0] * vout[0] + vin[1] * vout[1] + vin[2] * vout[2]) / (nin * nout))
                 .clamp(-1.0, 1.0);
         let turn = cos_turn.acos();
+        // See the scout in `evaluate_tour`: report the flown periapsis (safe
+        // floor when the turn overruns the safe limit), never a misleading 0.
         let periapsis_alt_km = if turn <= delta_max && turn > 1e-6 {
             let sh = (turn / 2.0).sin();
             (mu_b * (1.0 - sh) / (sh * vinf * vinf) - body.radius_km()).max(0.0)
         } else {
-            0.0
+            rp_min - body.radius_km()
         };
         if turn > delta_max {
             dv += 2.0 * vinf * ((turn - delta_max) / 2.0).sin();

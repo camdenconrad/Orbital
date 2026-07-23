@@ -774,6 +774,38 @@ fn veega_tour_search_is_sane() {
     assert!(sol.vinf_dep_kms > 0.5 && sol.vinf_dep_kms < 15.0);
     // Patched-conic legs land exactly on the target by construction.
     assert_eq!(sol.miss_km, 0.0);
+    // Issue #16: every flyby must sit at or above the body-safe periapsis
+    // floor — the scout is no longer allowed to buy an unphysical grazing or
+    // sub-surface pass for free.
+    for f in &sol.flybys {
+        let floor_alt = crate::solver::min_flyby_periapsis_km(f.body) - f.body.radius_km();
+        assert!(
+            f.periapsis_alt_km >= floor_alt - 1.0,
+            "{} flyby periapsis {:.0} km below safe floor {:.0} km",
+            f.body.name(),
+            f.periapsis_alt_km,
+            floor_alt
+        );
+    }
+}
+
+/// Issue #16: the safe-periapsis floor must respect each body's hazard —
+/// atmospheric bodies cleared above their air, gas giants well above cloud
+/// tops, airless bodies only grazed.
+#[test]
+fn flyby_periapsis_floor_respects_body_hazards() {
+    let alt = |b: BodyId| crate::solver::min_flyby_periapsis_km(b) - b.radius_km();
+    // Atmospheric: a couple hundred km of clearance, not a graze.
+    assert!(alt(BodyId::Earth) >= 150.0, "Earth floor {:.0} km", alt(BodyId::Earth));
+    assert!(alt(BodyId::Venus) >= 150.0);
+    assert!(alt(BodyId::Mars) >= 150.0);
+    // Gas giant: floor is a large fraction of the (huge) radius.
+    assert!(
+        crate::solver::min_flyby_periapsis_km(BodyId::Jupiter) > 1.2 * BodyId::Jupiter.radius_km()
+    );
+    // Airless: low but strictly above the surface.
+    let moon = alt(BodyId::Moon);
+    assert!(moon > 0.0 && moon < 0.2 * BodyId::Moon.radius_km(), "Moon floor {moon:.0} km");
 }
 
 /// Two-phase pipeline: beam search scouts to ~1e5 km, then the differential
