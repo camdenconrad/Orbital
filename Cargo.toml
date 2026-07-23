@@ -18,7 +18,3 @@ default = ["spice"]
 # DE440 ephemeris support via ANISE; falls back to built-in Keplerian
 # elements when data/de440s.bsp is absent or the feature is off.
 spice = ["dep:anise"]
-
-# The Rune fork of egui-winit (wlr-data-control clipboard). Same pin as cauldron.
-[patch.crates-io]
-egui-winit = { path = "/home/coffee/RustroverProjects/livewall-studio/vendor/egui-winit" }

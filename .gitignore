@@ -5,3 +5,9 @@ __pycache__/
 # JPL ephemeris kernels (32 MB; fetch from naif.jpl.nasa.gov)
 data/*.bsp
 .coven/
+
+# Editor/agent tooling leakage
+.cauldron/
+
+# Saved mission state (session-local; produced by the app)
+mission.orbital
