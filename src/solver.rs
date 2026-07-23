@@ -203,6 +203,34 @@ impl Launcher {
     }
 }
 
+/// Launch-site geodetic latitude, deg. All modeled launchers fly from the
+/// Cape (KSC/CCSFS, 28.5°N) — the U.S. planetary launch site.
+const LAUNCH_SITE_LAT_DEG: f64 = 28.5;
+
+/// C3-capability derate for the declination of the launch asymptote (DLA).
+///
+/// A launch vehicle can steer its outgoing asymptote to any |DLA| up to the
+/// site latitude by choosing launch azimuth, at no performance cost. Beyond
+/// that the parking-orbit plane must be inclined past the site latitude, which
+/// a direct ascent buys only with a lofted/dogleg trajectory or a plane
+/// change — both of which cut the C3 the vehicle can deliver. Modeled as a
+/// `cos` falloff in the excess declination past the site latitude, so the
+/// effective C3 cap is full inside |DLA| ≤ φ and drops toward the poles
+/// (≈0.5× at a polar asymptote from the Cape). Returns a multiplier in
+/// `(0, 1]`; `vinf` near zero (degenerate departures) has no defined
+/// declination and is left unpenalized.
+pub(crate) fn dla_c3_derate(vinf_vec: [f64; 3]) -> f64 {
+    let n = (vinf_vec[0].powi(2) + vinf_vec[1].powi(2) + vinf_vec[2].powi(2)).sqrt();
+    if n < 0.05 {
+        return 1.0;
+    }
+    let dla = (vinf_vec[2] / n).clamp(-1.0, 1.0).asin().to_degrees();
+    let excess = (dla.abs() - LAUNCH_SITE_LAT_DEG).max(0.0);
+    // cos over the reachable excess range [0, 90-φ]; floored so the cap never
+    // collapses to zero (a polar asymptote is costly, not impossible).
+    (excess.to_radians().cos()).max(0.4)
+}
+
 /// Thrust-profile segments per low-thrust genome.
 pub const N_SEG: usize = 12;
 
@@ -1058,13 +1086,19 @@ const INFEASIBLE_SCORE: f64 = 1.0e9;
 fn mission_score(
     cfg: &SolverConfig,
     vinf_dep: f64,
+    vinf_dep_vec: [f64; 3],
     arrival_dv: f64,
     tof_days: f64,
     extra: f64,
     hw_over_kms: f64,
 ) -> f64 {
     let base = cfg.objective.score(vinf_dep, arrival_dv, tof_days) + extra;
-    let vinf_max = cfg.launcher.c3_max().sqrt();
+    // The launcher's usable C3 falls with the declination of the outgoing
+    // asymptote (DLA) — see `dla_c3_derate`. Deriving the cap from the actual
+    // v∞ direction keeps a high-declination departure from claiming C3 the
+    // vehicle can only deliver in-plane. Low-C3 transfers sit far under the
+    // cap either way, so this bites only near-capability trajectories.
+    let vinf_max = (cfg.launcher.c3_max() * dla_c3_derate(vinf_dep_vec)).sqrt();
     let over = (vinf_dep - vinf_max).max(0.0) + hw_over_kms.max(0.0);
     if over > 0.0 {
         INFEASIBLE_SCORE + base + over
@@ -1205,6 +1239,7 @@ fn evaluate_lowthrust(
     let score = mission_score(
         cfg,
         vinf_dep,
+        g.vinf_dep,
         arrival_dv,
         g.legs[0],
         thrust_dv * 0.25 // propellant is cheaper than launch/capture Δv
@@ -1367,7 +1402,15 @@ fn evaluate_tour(
     let total_tof = g.total_tof_days();
     let arrival_dv = arrival_dv_kms(cfg.target, vinf_arr, cfg.mission);
     // DSM Δv is real propellant, charged exactly like powered-flyby Δv.
-    let score = mission_score(cfg, vinf_dep, arrival_dv, total_tof, assist_dv + dsm_dv, 0.0);
+    let score = mission_score(
+        cfg,
+        vinf_dep,
+        g.vinf_dep,
+        arrival_dv,
+        total_tof,
+        assist_dv + dsm_dv,
+        0.0,
+    );
 
     // Sample each conic for rendering — two sub-arcs when the leg has a DSM.
     let per_leg = (n_samples / g.legs.len().max(1)).max(8);
@@ -1500,6 +1543,7 @@ fn evaluate_direct(
     let score = mission_score(
         cfg,
         vinf_dep,
+        g.vinf_dep,
         arrival_dv,
         g.legs[0],
         excess * 1e-6 + miss_km * 3e-8,

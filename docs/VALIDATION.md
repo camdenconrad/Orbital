@@ -68,6 +68,17 @@ resonances — the domain trick that makes resonant-return tours findable.
 A manually specified VEEGA (`via=venus,earth,earth`, seed 12) still beats it
 (score 4.31 vs 6.15); deeper screening budgets close that gap (`steps=`).
 
+**Launch feasibility.** The launcher C3 cap is a hard bound (a candidate the
+vehicle can't inject is ranked below every feasible one, not charged a
+purchasable penalty). The usable cap additionally derates with the
+declination of the launch asymptote (DLA): full capability for |DLA| ≤ the
+launch-site latitude (28.5°, the Cape), falling as `cos(|DLA| − 28.5°)` toward
+a polar asymptote (~0.5× at ±90°), since reaching a steeply inclined asymptote
+costs a lofted/dogleg ascent or a plane change. DLA is `asin(v∞_z/|v∞|)` in the
+ICRF equatorial frame the ephemeris uses. This bites only near-capability
+trajectories — the validated low-C3 Mars/VEEGA solutions sit far under the cap
+and are unchanged (Mars 2020 still rediscovers at 2020-07-30, C3 14.4).
+
 **Mission types.** The arrival cost is mission-dependent: *flyby* (v∞ free),
 *orbit* (capture at 1.5 radii into an e = 0.95 ellipse — gives 1.01 km/s JOI
 above, vs ~0.6-0.9 km/s for real JOI into wider orbits), *land* (propulsive

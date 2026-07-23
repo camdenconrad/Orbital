@@ -789,6 +789,30 @@ fn veega_tour_search_is_sane() {
     }
 }
 
+/// Issue #17: a high-declination launch asymptote must derate the usable C3,
+/// while an in-plane (low-DLA) departure keeps the full cap. The derate only
+/// bites trajectories pushing near the launcher's capability.
+#[test]
+fn high_dla_departure_loses_c3_capability() {
+    use crate::solver::{dla_c3_derate, Launcher};
+    // In-ecliptic-ish, low-declination v∞: no penalty.
+    let low = dla_c3_derate([5.0, 0.3, 0.0]);
+    assert!((low - 1.0).abs() < 1e-9, "low-DLA derate {low}");
+    // Same magnitude but thrown far out of plane: strictly derated.
+    let high = dla_c3_derate([0.0, 0.0, 5.0]);
+    assert!(high < 0.6 && high > 0.3, "polar-DLA derate {high}");
+    // A departure just under the raw Falcon Heavy cap becomes infeasible once
+    // it is thrown to a polar asymptote (the derated cap falls below it).
+    let raw_cap = Launcher::FalconHeavy.c3_max().sqrt(); // ~7.75 km/s
+    let vmag = raw_cap * 0.95;
+    let polar = [0.0, 0.0, vmag];
+    let derated_cap = (Launcher::FalconHeavy.c3_max() * dla_c3_derate(polar)).sqrt();
+    assert!(
+        vmag > derated_cap,
+        "polar {vmag:.2} should exceed derated cap {derated_cap:.2}"
+    );
+}
+
 /// Issue #16: the safe-periapsis floor must respect each body's hazard —
 /// atmospheric bodies cleared above their air, gas giants well above cloud
 /// tops, airless bodies only grazed.
@@ -1070,12 +1094,13 @@ fn launcher_c3_cap_binds_on_direct_transfers() {
     use crate::solver::{evaluate_saved, Genome, Launcher, SolverConfig};
     let eph = Ephemeris::Kepler;
     let depart = j2000() + Duration::from_days(9000.0);
-    // |v∞| = sqrt(200) km/s along Earth's velocity: C3 = 200, over every cap.
-    let v = (200.0f64 / 3.0).sqrt();
+    // C3 = 200, over every cap. Kept in-plane (zero z ⇒ DLA = 0) so this test
+    // isolates the raw C3 cap; the declination derate is exercised separately
+    // by `high_dla_departure_loses_c3_capability` (issue #17).
     let g = Genome {
         depart_days: 0.0,
         legs: vec![250.0],
-        vinf_dep: [v, v, v],
+        vinf_dep: [10.0, 10.0, 0.0],
         thrust: Vec::new(),
         dsm: Vec::new(),
         branch: Vec::new(),
@@ -1165,8 +1190,11 @@ fn launcher_c3_cap_binds_on_tours() {
                 "in-cap tour was penalized: C3 {c3}, kick {}",
                 kick.score
             );
-            // What is left past the bound is the v∞ shortfall in km/s.
-            let expected = 1e9 + kick.score + (c3.sqrt() - 60.0f64.sqrt());
+            // What is left past the bound is the v∞ shortfall in km/s against
+            // the DLA-derated Falcon Heavy cap (issue #17): the effective cap
+            // depends on the departure asymptote's declination.
+            let cap = 60.0 * crate::solver::dla_c3_derate(fh.genome.vinf_dep);
+            let expected = 1e9 + kick.score + (c3.sqrt() - cap.sqrt());
             assert!(
                 (fh.score - expected).abs() < 1e-6,
                 "tour C3 shortfall wrong: C3 {c3}, FH {}, expected {expected}",
