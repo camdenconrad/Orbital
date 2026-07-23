@@ -9,6 +9,15 @@
 //!
 //! Body states are pre-sampled on the CPU (from the render table) and
 //! interpolated linearly in-shader for arrival epochs.
+//!
+//! Scope: the shader solves the *single-revolution* Lambert problem (both
+//! short- and long-way, whichever the prograde geometry selects). It does not
+//! sweep multi-revolution (N ≥ 1) transfers — those matter only for long-TOF
+//! outer-planet windows and are found by the CPU beam search, which does sweep
+//! revs. So the plot proposes single-rev windows; the search is not limited to
+//! them. Screening precision is deliberately loose (f32, 0.5-day linear span
+//! interpolation): a cell the user picks is always re-solved in f64 against the
+//! true ephemeris, so the plot only guides, never decides.
 
 use crate::bodies::{BodyId, DAY_S};
 use crate::ephemeris::Ephemeris;
